@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 
 import requests
 from fastapi import FastAPI
-from openai import OpenAI
+from langchain_openai import ChatOpenAI
 
 from agent.graph import build_graph
 from app.api import chat
@@ -21,7 +21,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 
 
 def build_agent():
-    """构建 LLM client + 工具 registry + dispatcher + LangGraph。"""
+    """构建 LLM + 工具 registry + dispatcher + LangGraph。"""
     registry = ToolRegistry()
     session = requests.Session()
 
@@ -30,18 +30,19 @@ def build_agent():
         registry.register(HttpTool(session, settings.rag_base_url, cfg, name))
 
     dispatcher = Dispatcher(registry)
-    client = OpenAI(
+    llm = ChatOpenAI(
         base_url=settings.ark_base_url,
         api_key=settings.ark_api_key,
+        model=settings.ark_model,
     )
-    graph = build_graph(client, dispatcher, settings.ark_model)
-    return client, dispatcher, graph
+    graph = build_graph(llm, dispatcher)
+    return llm, dispatcher, graph
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    client, dispatcher, graph = build_agent()
-    app.state.client = client
+    llm, dispatcher, graph = build_agent()
+    app.state.llm = llm
     app.state.dispatcher = dispatcher
     app.state.graph = graph
     app.state.system_prompt = settings.system_prompt

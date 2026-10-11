@@ -1,11 +1,11 @@
 # 运行依赖
 langgraph>=0.2
 langchain-core>=0.3
+langchain-openai>=0.2
 fastapi>=0.115
 uvicorn[standard]>=0.30
 pydantic>=2.7
 pydantic-settings>=2.3
-openai>=1.0
 requests>=2.31
 
 # 测试

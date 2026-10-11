@@ -1,10 +1,11 @@
 """图行为测试（不依赖真实 LLM / RAG 服务）。
 
-用 FakeClient 模拟 openai SDK 的 chat.completions.create 返回，
+用 FakeLLM 模拟 langchain_openai.ChatOpenAI 的 bind_tools().invoke() 返回，
 验证 call_llm → call_tool → 回填 → 结束的完整循环。
 """
 import json
 
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.graph import END
 
 from agent.graph import build_graph
@@ -12,7 +13,6 @@ from agent.nodes import call_llm, call_tool, route_after_llm
 from agent.state import AgentState
 from core import Dispatcher, ToolRegistry
 from core.tool import ToolBase, ToolResult
-from langchain_core.messages import HumanMessage, SystemMessage
 
 
 class _EchoTool(ToolBase):
@@ -35,51 +35,26 @@ class _EchoTool(ToolBase):
         return ToolResult(success=True, data={"echo": args.get("msg")})
 
 
-class _FakeChoice:
-    def __init__(self, msg):
-        self.message = msg
+class FakeLLM:
+    """模拟 ChatOpenAI：bind_tools 记录 schema，invoke 返回预设的 AIMessage 序列。"""
 
-
-class _FakeResponse:
-    def __init__(self, msg):
-        self.choices = [_FakeChoice(msg)]
-
-
-class _FakeToolCall:
-    def __init__(self, name, arguments, id="call_1"):
-        self.id = id
-        self.type = "function"
-        self.function = type("F", (), {"name": name, "arguments": arguments})()
-
-
-class _FakeMsg:
-    def __init__(self, content=None, tool_calls=None):
-        self.content = content
-        self.tool_calls = tool_calls
-
-
-class FakeClient:
     def __init__(self, replies):
+        # replies: list of AIMessage，按调用顺序逐个返回
         self._replies = list(replies)
         self.calls = []
-        self.chat = _FakeChat(self)
+        self.last_bound_tools = None
 
-    def create(self, **kwargs):
-        self.calls.append(kwargs)
-        return _FakeResponse(self._replies.pop(0))
+    def bind_tools(self, tools):
+        self.last_bound_tools = tools
+        return self
+
+    def invoke(self, messages):
+        self.calls.append({"messages": messages, "tools": self.last_bound_tools})
+        return self._replies.pop(0)
 
 
-class _FakeChat:
-    def __init__(self, owner):
-        self.completions = _FakeCompletions(owner)
-
-
-class _FakeCompletions:
-    def __init__(self, owner):
-        self.owner = owner
-
-    def create(self, **kwargs):
-        return self.owner.create(**kwargs)
+def _tool_call_message(name: str, args: dict) -> AIMessage:
+    return AIMessage(content="", tool_calls=[{"id": "call_1", "name": name, "args": args}])
 
 
 def _build_dispatcher() -> Dispatcher:
@@ -91,16 +66,12 @@ def _build_dispatcher() -> Dispatcher:
 def test_full_loop():
     dispatcher = _build_dispatcher()
 
-    # 第一轮：要求调工具；第二轮：给最终答案
-    client = FakeClient([
-        _FakeMsg(
-            content="",
-            tool_calls=[_FakeToolCall("echo", json.dumps({"msg": "hi"}))],
-        ),
-        _FakeMsg(content="回答：hi"),
+    llm = FakeLLM([
+        _tool_call_message("echo", {"msg": "hi"}),
+        AIMessage(content="回答：hi"),
     ])
 
-    llm_node = call_llm(client, dispatcher, model="fake")
+    llm_node = call_llm(llm, dispatcher)
     tool_node = call_tool(dispatcher)
 
     state: AgentState = {"messages": []}
@@ -121,23 +92,23 @@ def test_full_loop():
 
 def test_route_ends_without_tools():
     dispatcher = _build_dispatcher()
-    client = FakeClient([_FakeMsg(content="直接回答")])
+    llm = FakeLLM([AIMessage(content="直接回答")])
 
-    llm_node = call_llm(client, dispatcher, model="fake")
+    llm_node = call_llm(llm, dispatcher)
     state: AgentState = {"messages": []}
     state["messages"] += llm_node(state)["messages"]
     assert route_after_llm(state) == END
 
 
 def test_engine_full_loop():
-    """用官方 LangGraph 引擎完整跑一遍图（FakeClient 模拟 LLM）。"""
+    """用官方 LangGraph 引擎完整跑一遍图（FakeLLM 模拟 LLM）。"""
     dispatcher = _build_dispatcher()
-    client = FakeClient([
-        _FakeMsg(content="", tool_calls=[_FakeToolCall("echo", json.dumps({"msg": "hi"}))]),
-        _FakeMsg(content="回答：hi"),
+    llm = FakeLLM([
+        _tool_call_message("echo", {"msg": "hi"}),
+        AIMessage(content="回答：hi"),
     ])
 
-    graph = build_graph(client, dispatcher, model="fake")
+    graph = build_graph(llm, dispatcher)
     final_state = graph.invoke({
         "messages": [SystemMessage(content="sys"), HumanMessage(content="hi")],
     })
@@ -146,5 +117,5 @@ def test_engine_full_loop():
     assert contents == ["sys", "hi", "", "{'echo': 'hi'}", "回答：hi"]
 
     # 第二次调用 LLM 时，tools 已带上且 messages 是历史
-    tools_arg = client.calls[1]["tools"]
+    tools_arg = llm.calls[1]["tools"]
     assert tools_arg[0]["function"]["name"] == "echo"

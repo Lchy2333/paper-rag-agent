@@ -11,15 +11,16 @@
                     END
 """
 from langgraph.graph import END, START, StateGraph
+from langgraph.graph.state import CompiledStateGraph
 
 from agent.nodes import call_llm, call_tool, route_after_llm
 from agent.state import AgentState
 
 
-def build_graph(client, dispatcher, model: str) -> "CompiledStateGraph":
+def build_graph(llm, dispatcher) -> CompiledStateGraph:
     graph = StateGraph(AgentState)
 
-    graph.add_node("call_llm", call_llm(client, dispatcher, model))
+    graph.add_node("call_llm", call_llm(llm, dispatcher))
     graph.add_node("call_tool", call_tool(dispatcher))
 
     graph.add_edge(START, "call_llm")
