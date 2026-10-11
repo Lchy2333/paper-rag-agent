@@ -1,0 +1,149 @@
+{
+    "health_check": {
+        "description": "检查RAG服务的健康状态，无参数",
+        "path": "/api/v1/health",
+        "method": "GET",
+        "schema": {
+            "type": "object",
+            "properties": {}
+        }
+    },
+    "test_connection": {
+        "description": "测试一个模型连接的可用性，参数为连接配置",
+        "path": "/api/v1/connections/test",
+        "method": "POST",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "kind": {
+                    "type": "string",
+                    "enum": ["embedding", "chat", "formula"],
+                    "description": "连接类型：embedding/chat/formula"
+                },
+                "base_url": {
+                    "type": "string",
+                    "description": "模型地址，须公网可达"
+                },
+                "model": {
+                    "type": "string",
+                    "description": "模型名"
+                },
+                "api_key": {
+                    "type": "string",
+                    "description": "API密钥，可选"
+                }
+            },
+            "required": ["kind", "base_url", "model"]
+        }
+    },
+    "upload_documents": {
+        "description": "向RAG库上传PDF文档并向量化。注意：需要用户提供本地PDF文件路径，模型无法自行生成文件内容",
+        "path": "/api/v1/documents",
+        "method": "POST",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "chunk_size": {
+                    "type": "integer",
+                    "description": "覆盖分块大小，可选"
+                },
+                "chunk_overlap": {
+                    "type": "integer",
+                    "description": "覆盖重叠字符数，可选"
+                }
+            }
+        }
+    },
+    "documents_list": {
+        "description": "查看RAG库中全部已向量化的文档",
+        "path": "/api/v1/documents",
+        "method": "GET",
+        "schema": {
+            "type": "object",
+            "properties": {}
+        }
+    },
+    "find_doc_by_id": {
+        "description": "根据指定已向量化的文档id，查询文档信息",
+        "path": "/api/v1/documents/:id",
+        "method": "GET",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "description": "目标文档id"
+                }
+            },
+            "required": ["id"]
+        }
+    },
+    "rechunk_document": {
+        "description": "按新的分块参数对指定文档重新分块",
+        "path": "/api/v1/documents/:id/rechunk",
+        "method": "POST",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "description": "目标文档id"
+                },
+                "chunk_size": {
+                    "type": "integer",
+                    "description": "新分块大小，可选，缺省用文档当前参数"
+                },
+                "chunk_overlap": {
+                    "type": "integer",
+                    "description": "新重叠字符数，可选，缺省用文档当前参数"
+                }
+            },
+            "required": ["id"]
+        }
+    },
+    "delete_document": {
+        "description": "从RAG库中删除指定文档及其向量",
+        "path": "/api/v1/documents/:id",
+        "method": "DELETE",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "description": "目标文档id"
+                }
+            },
+            "required": ["id"]
+        }
+    },
+    "ask_rag": {
+        "description": "向RAG库提问，返回基于已向量化文档的检索增强回答",
+        "path": "/api/v1/ask",
+        "method": "POST",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "问题内容"
+                },
+                "top_k": {
+                    "type": "integer",
+                    "description": "检索返回条数，默认5，勿设为1"
+                },
+                "document_ids": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "description": "限定检索范围，空则全库检索"
+                },
+                "user_id": {
+                    "type": "string",
+                    "description": "用户标识，缺省为local"
+                }
+            },
+            "required": ["query"]
+        }
+    }
+}
