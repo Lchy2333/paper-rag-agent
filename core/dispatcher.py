@@ -12,8 +12,9 @@ if TYPE_CHECKING:
 class Dispatcher:
     """调度器：查工具 → (可重试地) 执行工具 → 包成 ToolResult。"""
 
-    def __init__(self, registry: "ToolRegistry"):
+    def __init__(self, registry: "ToolRegistry", sleep=time.sleep):
         self.registry = registry
+        self.sleep = sleep
 
     def dispatch(self, tool_name: str, args_json: str) -> ToolResult:
         try:
@@ -32,6 +33,7 @@ class Dispatcher:
                 retryable=is_transient,
                 max_attempts=3,
                 jitter_ratio=0.1,
+                sleep=self.sleep,
             )
         except Exception as e:
             return ToolResult(success=False, error=f"calling tool failed: {e}")

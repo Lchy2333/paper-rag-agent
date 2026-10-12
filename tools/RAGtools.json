@@ -105,6 +105,7 @@
         "description": "从RAG库中删除指定文档及其向量",
         "path": "/api/v1/documents/:id",
         "method": "DELETE",
+        "requires_approval": true,
         "schema": {
             "type": "object",
             "properties": {
