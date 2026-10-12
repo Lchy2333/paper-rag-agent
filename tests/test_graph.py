@@ -78,7 +78,7 @@ def test_full_loop():
 
     # call_llm 第一轮
     state["messages"] += llm_node(state)["messages"]
-    assert route_after_llm(state) == "call_tool"
+    assert route_after_llm(state) == "guard"
 
     # call_tool 执行并回填
     state["messages"] += tool_node(state)["messages"]

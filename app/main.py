@@ -10,9 +10,10 @@ from contextlib import asynccontextmanager
 import requests
 from fastapi import FastAPI
 from langchain_openai import ChatOpenAI
+from langgraph.checkpoint.memory import MemorySaver
 
 from agent.graph import build_graph
-from app.api import chat
+from app.api import approve, chat
 from app.config import settings
 from core import Dispatcher, ToolRegistry
 from tools.http_tool import HttpTool
@@ -35,7 +36,10 @@ def build_agent():
         api_key=settings.ark_api_key,
         model=settings.ark_model,
     )
-    graph = build_graph(llm, dispatcher)
+    # checkpointer 是 HITL 中断恢复 + 多轮会话的存档仓库；
+    # MemorySaver 是进程内存态，生产应换持久化实现（SQLite/Postgres）。
+    checkpointer = MemorySaver()
+    graph = build_graph(llm, dispatcher, checkpointer)
     return llm, dispatcher, graph
 
 
@@ -51,6 +55,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="paper-rag-agent", lifespan=lifespan)
 app.include_router(chat.router, prefix="/api", tags=["chat"])
+app.include_router(approve.router, prefix="/api", tags=["chat"])
 
 
 @app.get("/health")

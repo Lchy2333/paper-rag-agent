@@ -9,10 +9,12 @@
 import json
 from typing import Any, Callable, Dict
 
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from langgraph.graph import END
+from langgraph.types import interrupt
 
 from core.dispatcher import Dispatcher
+from core.retry import is_transient, retry_call
 
 
 def call_llm(llm, dispatcher: Dispatcher) -> Callable:
@@ -20,10 +22,18 @@ def call_llm(llm, dispatcher: Dispatcher) -> Callable:
 
     llm 是 langchain_openai.ChatOpenAI 实例。
     bind_tools 把工具 schema 绑到模型；invoke 直接收 LangChain 消息、返回 AIMessage。
+    LLM 调用包一层 retry_call：ARK 超时/限流/5xx 等瞬态失败指数退避重试（最多 3 次），
+    复用 dispatcher.sleep（测试可注入 no-op）。
     """
     def node(state: Dict[str, Any]) -> Dict[str, Any]:
         llm_with_tools = llm.bind_tools(dispatcher.registry.list_schemas())
-        response = llm_with_tools.invoke(state["messages"])
+        response = retry_call(
+            lambda: llm_with_tools.invoke(state["messages"]),
+            retryable=is_transient,
+            max_attempts=3,
+            jitter_ratio=0.1,
+            sleep=dispatcher.sleep,
+        )
         print(f"llm_response: {response}")
         return {"messages": [response]}
 
@@ -48,8 +58,45 @@ def call_tool(dispatcher: Dispatcher) -> Callable:
 
 
 def route_after_llm(state: Dict[str, Any]) -> str:
-    """条件边：LLM 决定调工具 → call_tool；否则结束。"""
+    """条件边：LLM 决定调工具 → guard（先过审批）；否则结束。"""
     last = state["messages"][-1]
     if isinstance(last, AIMessage) and last.tool_calls:
-        return "call_tool"
+        return "guard"
     return END
+
+
+def guard_node(dispatcher: Dispatcher) -> Callable:
+    """审批节点：发现 requires_approval 的工具调用 → interrupt 挂起等用户审批。
+
+    interrupt() 第一次执行时挂起整张图（invoke 返回，状态存入 checkpointer）；
+    用户通过 /api/approve 恢复后，interrupt() 返回 resume 值（"allow"/"reject"）。
+    interrupt() 之前的代码必须是纯计算（恢复时节点会从头重跑，有副作用会重复执行）。
+    """
+    def node(state: Dict[str, Any]) -> Dict[str, Any]:
+        last = state["messages"][-1]
+        pending = [
+            tc for tc in last.tool_calls
+            if (tool := dispatcher.registry.get(tc["name"]))
+            and getattr(tool, "requires_approval", False)
+        ]
+        if not pending:
+            return {"route": "noop"}
+
+        decision = interrupt({
+            "tool": pending[0]["name"],
+            "args": pending[0]["args"],
+        })
+        if decision == "allow":
+            return {"route": "approve"}
+        return {
+            "route": "reject",
+            "messages": [SystemMessage(
+                content="用户拒绝了该工具调用，请勿执行，并向用户说明原因。")],
+        }
+
+    return node
+
+
+def route_after_guard(state: Dict[str, Any]) -> str:
+    """条件边：guard 决策 → approve/noop 走 call_tool，reject 跳过工具回 call_llm。"""
+    return state.get("route", "approve")

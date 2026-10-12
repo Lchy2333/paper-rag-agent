@@ -17,6 +17,11 @@ class HttpTool(ToolBase):
     def name(self) -> str:
         return self._name
 
+    @property
+    def requires_approval(self) -> bool:
+        """是否需要人工审批（RAGtools.json 中 requires_approval: true 的工具）。"""
+        return self.config.get("requires_approval", False)
+
     def build_schema(self) -> Dict[str, Any]:
         return {
             "type": "function",
@@ -34,18 +39,15 @@ class HttpTool(ToolBase):
         # 路径参数替换：/documents/:id -> /documents/{id}
         url, body_args = self._build_url(path, args)
 
-        try:
-            start = time.time()
-            if method == "GET":
-                resp = self.session.get(url, params=body_args, timeout=30)
-            else:
-                resp = self.session.request(method, url, json=body_args, timeout=30)
-            resp.raise_for_status()
-            return ToolResult(success=True, data=resp.json(), latency_ms=(time.time() - start) * 1000)
-        except requests.Timeout:
-            return ToolResult(success=False, error=f"request timeout: {url}")
-        except requests.RequestException as e:
-            return ToolResult(success=False, error=str(e))
+        # 网络错误（超时/连接/HTTP 状态/非 JSON 响应）直接抛出，
+        # 由 Dispatcher 的 retry_call 统一判定瞬态错误并重试。
+        start = time.time()
+        if method == "GET":
+            resp = self.session.get(url, params=body_args, timeout=30)
+        else:
+            resp = self.session.request(method, url, json=body_args, timeout=30)
+        resp.raise_for_status()
+        return ToolResult(success=True, data=resp.json(), latency_ms=(time.time() - start) * 1000)
 
     def _build_url(self, path: str, args: Dict[str, Any]) -> tuple:
         """替换 :param 路径参数，剩余参数作为 query/body。"""
