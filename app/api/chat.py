@@ -16,6 +16,7 @@ def chat(req: ChatRequest, request: Request) -> ChatResponse:
 
     thread_id = req.thread_id or uuid.uuid4().hex
     config = {"configurable": {"thread_id": thread_id}}
+    request.state.thread_id = thread_id  # 捎带给 exception_handler 做日志关联
 
     # 已有会话 → 读取快照判断状态（挂起中 / 已完成 / 不存在）
     snapshot = graph.get_state(config) if req.thread_id else None

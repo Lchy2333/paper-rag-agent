@@ -15,6 +15,7 @@ router = APIRouter()
 def approve(req: ApproveRequest, request: Request):
     graph = request.app.state.graph
     config = {"configurable": {"thread_id": req.thread_id}}
+    request.state.thread_id = req.thread_id  # 捎带给 exception_handler 做日志关联
     resume_value = "allow" if req.approved else "reject"
 
     result = graph.invoke(Command(resume=resume_value), config=config)
