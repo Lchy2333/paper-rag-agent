@@ -20,6 +20,8 @@ class Settings(BaseSettings):
 
     # RAG 服务
     rag_base_url: str = "http://localhost:8080"
+    # 服务间鉴权（RAG 的 server.api_key）；为空表示 RAG 未启用鉴权，不发送该头
+    rag_api_key: str = ""
 
     # 工具配置
     tools_config: Path = PROJECT_ROOT / "tools" / "RAGtools.json"
