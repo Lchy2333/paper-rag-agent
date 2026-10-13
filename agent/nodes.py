@@ -7,6 +7,7 @@
 ——ChatOpenAI 原生收/发 LangChain 消息，无需手动转换 dict。
 """
 import json
+import logging
 from typing import Any, Callable, Dict
 
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
@@ -15,6 +16,8 @@ from langgraph.types import interrupt
 
 from core.dispatcher import Dispatcher
 from core.retry import is_transient, retry_call
+
+logger = logging.getLogger(__name__)
 
 
 def call_llm(llm, dispatcher: Dispatcher) -> Callable:
@@ -34,7 +37,7 @@ def call_llm(llm, dispatcher: Dispatcher) -> Callable:
             jitter_ratio=0.1,
             sleep=dispatcher.sleep,
         )
-        print(f"llm_response: {response}")
+        logger.info("llm_response: %s", response)
         return {"messages": [response]}
 
     return node
@@ -48,7 +51,7 @@ def call_tool(dispatcher: Dispatcher) -> Callable:
         for tc in last.tool_calls:
             name = tc["name"]
             args = json.dumps(tc["args"])
-            print(f"Calling tool: {name}({args})")
+            logger.info("Calling tool: %s(%s)", name, args)
             result = dispatcher.dispatch(name, args)
             content = result.data if result.success else f"工具执行失败: {result.error}"
             tool_msgs.append(ToolMessage(content=str(content), tool_call_id=tc["id"]))
