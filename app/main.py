@@ -10,14 +10,17 @@ import logging
 import sys
 from contextlib import asynccontextmanager
 
+import psycopg
 import requests
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from langchain_openai import ChatOpenAI
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.postgres import PostgresSaver
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 
 from agent.graph import build_graph
-from app.api import approve, chat
+from app.api import approve, auth, chat, threads
 from app.config import settings
 from app.errors import classify_exception
 from core import Dispatcher, ToolRegistry
@@ -51,25 +54,40 @@ def build_agent():
         model=settings.ark_model,
     )
     # checkpointer 是 HITL 中断恢复 + 多轮会话的存档仓库；
-    # MemorySaver 是进程内存态，生产应换持久化实现（SQLite/Postgres）。
-    checkpointer = MemorySaver()
+    # 生产用 Postgres 持久化（独立库 paper_rag_agent），多副本共享会话状态，
+    # 进程重启不丢对话。池内连接对齐 PostgresSaver 要求：autocommit + dict_row。
+    pool = ConnectionPool(
+        conninfo=settings.database_url,
+        max_size=10,
+        open=False,
+        kwargs={"autocommit": True, "row_factory": dict_row},
+    )
+    pool.open()
+    checkpointer = PostgresSaver(pool)
+    checkpointer.setup()  # 自动建 checkpoints / checkpoint_blobs / checkpoint_writes
     graph = build_graph(llm, dispatcher, checkpointer)
-    return llm, dispatcher, graph
+    return llm, dispatcher, graph, pool
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    llm, dispatcher, graph = build_agent()
+    llm, dispatcher, graph, pool = build_agent()
     app.state.llm = llm
     app.state.dispatcher = dispatcher
     app.state.graph = graph
+    app.state.pool = pool
     app.state.system_prompt = settings.system_prompt
-    yield
+    try:
+        yield
+    finally:
+        pool.close()
 
 
 app = FastAPI(title="paper-rag-agent", lifespan=lifespan)
+app.include_router(auth.router, prefix="/api", tags=["auth"])
 app.include_router(chat.router, prefix="/api", tags=["chat"])
 app.include_router(approve.router, prefix="/api", tags=["chat"])
+app.include_router(threads.router, prefix="/api", tags=["threads"])
 
 
 @app.exception_handler(Exception)
@@ -83,9 +101,10 @@ async def uncaught_exception_handler(request: Request, exc: Exception):
     """
     status, code, message = classify_exception(exc)
     logger.error(
-        "request_failed path=%s thread_id=%s exc_type=%s exc_msg=%s",
+        "request_failed path=%s thread_id=%s user_id=%s exc_type=%s exc_msg=%s",
         request.url.path,
         getattr(request.state, "thread_id", None),
+        getattr(request.state, "user_id", None),
         type(exc).__name__,
         str(exc)[:200],
     )

@@ -3,52 +3,90 @@
 学术论文检索 + RAG agent：**FastAPI + LangGraph** 服务。
 
 由 paper-rag-agent-MVP 升级而来：自研 StateGraph 引擎替换为官方 `langgraph`，新增 FastAPI 服务层。
+已落地**多用户隔离 + 对话持久化**（PostgreSQL checkpointer + JWT 认证 + 线程归属绑定）。
 
 ## 项目结构
 
 ```
 app/                  # FastAPI 服务层
-  main.py               # 应用入口：lifespan 构建 graph、挂路由
-  config.py             # pydantic-settings 读 .env
+  main.py               # 应用入口：lifespan 构建 graph / PostgresSaver / 挂路由
+  config.py             # pydantic-settings 读 .env（含 DATABASE_URL / JWT_SECRET）
   schemas.py            # Pydantic 请求/响应模型
-  api/chat.py           # POST /chat
+  auth.py               # bcrypt 密码哈希 + JWT 签发/验签 + get_current_user 依赖
+  db.py                 # users / threads / audit_logs 仓储
+  api/chat.py           # POST /chat（认证 + 线程归属校验）
+  api/approve.py        # POST /approve（HITL 审批，归属校验 + 审计）
+  api/auth.py           # POST /auth/register / /auth/login
+  api/threads.py        # GET/PATCH/DELETE /threads（列表 / 改名 / 置顶 / 删除）
 agent/                # LangGraph 层
-  state.py              # AgentState（add_messages reducer）
-  nodes.py              # call_llm / call_tool / route_after_llm
-  graph.py              # 官方 StateGraph 组装 ReAct 图
+  state.py              # AgentState（messages / route 通道）
+  nodes.py              # call_llm / call_tool / guard_node（审批）
+  graph.py              # 官方 StateGraph 组装 ReAct 图（含 HITL 护栏）
 core/                 # 核心抽象层（与业务无关）
   tool.py / registry.py / dispatcher.py / retry.py
 tools/                # 具体工具
   RAGtools.json         # RAG 接口声明（一个接口 = 一段配置）
-  http_tool.py          # 通用 HTTP 工具（配置驱动，无需子类）
+  http_tool.py          # 通用 HTTP 工具（自动注入 X-User-ID 头）
+migrations/           # 数据库迁移脚本（001 建表 / 002 置顶列）
 tests/                # 测试
 ```
 
 ## 图结构
 
 ```
-START → call_llm ──(有 tool_calls)──► call_tool
-              │                         │
-              └─────(无 tool_calls)─────┘
-                         ▼
-                        END
+START → call_llm ──(有 tool_calls)──► guard ──(approve/noop)──► call_tool
+              │                           └────(reject)──► call_llm（跳过工具）
+              └─────(无 tool_calls)────────────────────► END
+```
+
+## 架构总览
+
+```
+用户 ──► Agent 服务（多副本，无状态编排）
+          ├─ /auth/register · /auth/login   → 签发 JWT
+          ├─ get_current_user               → 验签得 user_id（可信）
+          ├─ /chat · /approve · /threads    → threads 归属校验（越权 403）
+          ├─ PostgresSaver                  → 对话落盘（库 paper_rag_agent）
+          └─ HttpTool → X-API-Key + X-User-ID
+                │
+                ▼
+        RAG 服务（Go）：UserContext 读 X-User-ID → 文档级隔离
 ```
 
 ## 快速开始
 
+### 1. 准备 PostgreSQL
+
+- 建库：`paper_rag_agent`（与 RAG 的 `paper_rag` 分库，共用同一 PG 实例）
+- 执行迁移（幂等，可重复跑）：
+  - `migrations/001_init.sql`：users / threads / audit_logs
+  - `migrations/002_threads_pinned.sql`：threads 加 pinned 列
+- `checkpoints` 系列表由 `PostgresSaver.setup()` 启动时自动创建
+
+### 2. 配置 .env
+
 ```bash
-# 1. 创建虚拟环境
-uv venv .venv
-.venv\Scripts\activate
-
-# 2. 安装依赖
-uv pip install -r requirements.txt
-
-# 3. 配置 .env
 copy .env.example .env
-# 编辑 .env：ARK_API_KEY、RAG_BASE_URL 等
+# 必填：ARK_API_KEY、DATABASE_URL、JWT_SECRET
+```
 
-# 4. 启动服务
+关键项：
+
+```
+ARK_BASE_URL=https://ark.cn-beijing.volces.com/api/plan/v3/
+ARK_API_KEY=your-ark-api-key
+ARK_MODEL=deepseek-v4-flash
+RAG_BASE_URL=http://localhost:8080
+RAG_API_KEY=your-rag-api-key
+DATABASE_URL=postgresql://postgres:密码@localhost:5432/paper_rag_agent
+JWT_SECRET=<随机串，python -c "import secrets; print(secrets.token_urlsafe(48))">
+JWT_EXPIRE_MINUTES=10080
+```
+
+### 3. 创建用户并启动
+
+```bash
+# 建库建表后，用注册接口或直接插库创建用户（如 admin）
 uvicorn app.main:app --reload --port 8001
 ```
 
@@ -59,20 +97,39 @@ uvicorn app.main:app --reload --port 8001
 pytest tests\ -v
 ```
 
-测试用 FakeClient 模拟 LLM，不依赖真实网络。
+测试用 FakeClient 模拟 LLM，不依赖真实网络与数据库。
 
 ## API
 
-| 端点 | 方法 | 说明 |
-|---|---|---|
-| `/health` | GET | 健康检查 |
-| `/api/chat` | POST | 对话 |
+| 端点 | 方法 | 认证 | 说明 |
+|---|---|---|---|
+| `/health` | GET | 无 | 健康检查 |
+| `/api/auth/register` | POST | 无 | 注册（201 / 409 / 422） |
+| `/api/auth/login` | POST | 无 | 登录 → JWT（200 / 401 / 403） |
+| `/api/chat` | POST | Bearer | 对话（新会话 / 续聊 / 审批挂起） |
+| `/api/approve` | POST | Bearer | HITL 审批（越权 403 / 不存在 404） |
+| `GET /api/threads` | GET | Bearer | 列自己的会话（置顶优先） |
+| `PATCH /api/threads/{id}` | PATCH | Bearer | 改名 / 置顶 |
+| `DELETE /api/threads/{id}` | DELETE | Bearer | 删除会话（连带对话快照） |
+
+**认证方式**：所有业务接口需 `Authorization: Bearer <JWT>` 头；JWT 由 `/api/auth/login` 签发。
 
 ```bash
-curl -X POST http://localhost:8001/api/chat \
+# 1. 登录拿 token
+curl -s -X POST http://localhost:8001/api/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"query": "当前数据库中有哪些已向量化的文档？"}'
+  -d '{"username":"admin","password":"..."}'
+
+# 2. 带 token 对话
+curl -s -X POST http://localhost:8001/api/chat \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <token>" \
+  -d '{"query":"当前数据库中有哪些已向量化的文档？"}'
 ```
+
+**多用户隔离**：会话按 `threads` 表绑定 `thread_id ↔ user_id`，跨用户访问返回 403；
+`user_id` 经 LangGraph config → Dispatcher → HttpTool 注入 `X-User-ID` 头传给 RAG，
+实现文档级隔离（admin 为全库超级用户，由 RAG 侧 `server.admin_users` 配置）。
 
 ## RAG 接口接入
 
@@ -82,3 +139,6 @@ curl -X POST http://localhost:8001/api/chat \
 - `path`：接口路径，`/api/v1/documents/:id` 形式的 `:param` 会替换为参数值
 - `method`：HTTP 方法（GET / POST / DELETE / ...）
 - `schema`：OpenAI 工具调用参数 schema（`type` / `properties` / `required`）
+
+> 注意：`user_id` 不要写进 schema——它由 `HttpTool` 从认证上下文自动注入 `X-User-ID` 头，
+> LLM 不应看到、也无法伪造。`ask_rag` 工具已移除（ask 是 RAG 侧全局检索接口，仅管理员直接调用）。

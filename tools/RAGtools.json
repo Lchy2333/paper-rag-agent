@@ -117,36 +117,6 @@
             "required": ["id"]
         }
     },
-    "ask_rag": {
-        "description": "向RAG库提问，返回基于已向量化文档的检索增强回答",
-        "path": "/api/v1/ask",
-        "method": "POST",
-        "schema": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "问题内容"
-                },
-                "top_k": {
-                    "type": "integer",
-                    "description": "检索返回条数，默认5，勿设为1"
-                },
-                "document_ids": {
-                    "type": "array",
-                    "items": {
-                        "type": "string"
-                    },
-                    "description": "限定检索范围，空则全库检索"
-                },
-                "user_id": {
-                    "type": "string",
-                    "description": "用户标识，缺省为local"
-                }
-            },
-            "required": ["query"]
-        }
-    },
     "search_rag": {
         "description": "在论文库中检索相关片段，返回结构化chunks（不调LLM生成答案），供Agent自拼上下文回答",
         "path": "/api/v1/search",
@@ -168,10 +138,6 @@
                         "type": "string"
                     },
                     "description": "限定检索范围，空则全库检索"
-                },
-                "user_id": {
-                    "type": "string",
-                    "description": "用户标识，缺省为local"
                 }
             },
             "required": ["query"]

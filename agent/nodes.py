@@ -11,6 +11,7 @@ import logging
 from typing import Any, Callable, Dict
 
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END
 from langgraph.types import interrupt
 
@@ -44,15 +45,23 @@ def call_llm(llm, dispatcher: Dispatcher) -> Callable:
 
 
 def call_tool(dispatcher: Dispatcher) -> Callable:
-    """节点：执行最后一条 assistant 消息里的所有工具调用，返回 tool 消息。"""
-    def node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """节点：执行最后一条 assistant 消息里的所有工具调用，返回 tool 消息。
+
+    config 里可携带 user_id（由 /chat 路由从认证上下文注入，LLM 不可见），
+    经 Dispatcher 透传给工具作为 X-User-ID 头（多用户文档隔离）。
+    """
+    def node(state: Dict[str, Any], config: RunnableConfig | None = None) -> Dict[str, Any]:
+        # 兼容：graph.invoke 会传 config；测试直接调用 node(state) 时 config=None
+        user_id = None
+        if config:
+            user_id = (config.get("configurable") or {}).get("user_id")
         last = state["messages"][-1]
         tool_msgs = []
         for tc in last.tool_calls:
             name = tc["name"]
             args = json.dumps(tc["args"])
-            logger.info("Calling tool: %s(%s)", name, args)
-            result = dispatcher.dispatch(name, args)
+            logger.info("Calling tool: %s(%s) user_id=%s", name, args, user_id)
+            result = dispatcher.dispatch(name, args, user_id=user_id)
             content = result.data if result.success else f"工具执行失败: {result.error}"
             tool_msgs.append(ToolMessage(content=str(content), tool_call_id=tc["id"]))
         return {"messages": tool_msgs}

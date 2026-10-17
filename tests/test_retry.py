@@ -131,7 +131,7 @@ class _EchoTool(ToolBase):
             },
         }
 
-    def execute(self, args):
+    def execute(self, args, user_id=None):
         return ToolResult(success=True, data={"echo": args.get("msg")})
 
 
@@ -167,7 +167,7 @@ def test_call_llm_raises_after_max_attempts():
 # ---------- L2：工具链路重试 ----------
 
 class _FakeTimeoutSession:
-    def request(self, method, url, json=None, timeout=30):
+    def request(self, method, url, json=None, timeout=30, headers=None):
         raise requests.Timeout("boom")
 
 
@@ -202,7 +202,7 @@ class _FlakyTool(ToolBase):
             },
         }
 
-    def execute(self, args):
+    def execute(self, args, user_id=None):
         self.calls += 1
         if self.calls == 1:
             raise requests.Timeout("boom")
@@ -228,7 +228,7 @@ class _BoomTool(ToolBase):
             },
         }
 
-    def execute(self, args):
+    def execute(self, args, user_id=None):
         self.calls += 1
         raise ValueError("bad args")
 

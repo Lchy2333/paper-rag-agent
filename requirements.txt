@@ -8,5 +8,14 @@ pydantic>=2.7
 pydantic-settings>=2.3
 requests>=2.31
 
+# 多用户隔离 + 会话持久化（方案 B）
+#   - PostgresSaver：对话 checkpointer 落库（migrations/001_init.sql 建自建表）
+#   - pyjwt / bcrypt：阶段 B1 认证（注册/登录/JWT）
+langgraph-checkpoint-postgres>=3.2
+psycopg[binary]>=3.2
+psycopg-pool>=3.2
+pyjwt>=2.8
+bcrypt>=4.0
+
 # 测试
 pytest>=8.0

@@ -55,7 +55,7 @@ class _DeleteTool(ToolBase):
             },
         }
 
-    def execute(self, args):
+    def execute(self, args, user_id=None):
         self.called += 1
         return ToolResult(success=True, data={"deleted": args["id"]})
 
@@ -76,7 +76,7 @@ class _EchoTool(ToolBase):
             },
         }
 
-    def execute(self, args):
+    def execute(self, args, user_id=None):
         return ToolResult(success=True, data={"echo": args.get("msg")})
 
 
