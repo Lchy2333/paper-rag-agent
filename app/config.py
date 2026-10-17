@@ -23,6 +23,13 @@ class Settings(BaseSettings):
     # 服务间鉴权（RAG 的 server.api_key）；为空表示 RAG 未启用鉴权，不发送该头
     rag_api_key: str = ""
 
+    # Agent 数据库（Postgres 独立库 paper_rag_agent；会话持久化 + 多用户）
+    database_url: str = "postgresql://postgres:postgres@localhost:5432/paper_rag_agent"
+
+    # JWT 认证（阶段 B1：注册/登录）
+    jwt_secret: str = ""
+    jwt_expire_minutes: int = 10080
+
     # 工具配置
     tools_config: Path = PROJECT_ROOT / "tools" / "RAGtools.json"
 

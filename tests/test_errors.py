@@ -7,6 +7,7 @@ import openai
 import pytest
 from fastapi.testclient import TestClient
 
+from app.auth import get_current_user
 from app.main import app
 
 
@@ -37,10 +38,46 @@ class _FailingGraph:
 
 
 @pytest.fixture()
-def client():
+def client(monkeypatch):
+    """替换 build_agent，避免测试触发真实 PG 连接（错误处理测试只关心 handler 分类）。"""
+    class _FakeCursor:
+        def fetchone(self):
+            return None
+
+        def fetchall(self):
+            return []
+
+    class _FakeConn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def execute(self, *args, **kwargs):
+            return _FakeCursor()
+
+    class _FakePool:
+        def connection(self):
+            return _FakeConn()
+
+        def close(self):
+            pass
+
+    def fake_build_agent():
+        return None, None, None, _FakePool()  # llm, dispatcher, graph, pool
+
+    monkeypatch.setattr("app.main.build_agent", fake_build_agent)
+    # 覆盖认证依赖：错误分类测试不关心鉴权，直接以假用户身份放行
+    app.dependency_overrides[get_current_user] = lambda: {
+        "id": "00000000-0000-0000-0000-000000000000",
+        "username": "tester",
+        "disabled": False,
+    }
     # raise_server_exceptions=False：异常由我们的 handler 消费，专注断言响应体
     with TestClient(app, raise_server_exceptions=False) as c:
         yield c
+    app.dependency_overrides.pop(get_current_user, None)
 
 
 def _post_chat_with_error(client, exc):

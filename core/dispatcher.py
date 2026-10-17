@@ -16,7 +16,7 @@ class Dispatcher:
         self.registry = registry
         self.sleep = sleep
 
-    def dispatch(self, tool_name: str, args_json: str) -> ToolResult:
+    def dispatch(self, tool_name: str, args_json: str, user_id: str | None = None) -> ToolResult:
         try:
             args = json.loads(args_json) if args_json else {}
         except json.JSONDecodeError as e:
@@ -29,7 +29,7 @@ class Dispatcher:
         start = time.time()
         try:
             tool_result = retry_call(
-                lambda: tool.execute(args),
+                lambda: tool.execute(args, user_id=user_id),
                 retryable=is_transient,
                 max_attempts=3,
                 jitter_ratio=0.1,

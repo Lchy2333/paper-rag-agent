@@ -31,7 +31,7 @@ class _EchoTool(ToolBase):
             },
         }
 
-    def execute(self, args):
+    def execute(self, args, user_id=None):
         return ToolResult(success=True, data={"echo": args.get("msg")})
 
 

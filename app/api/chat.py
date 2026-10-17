@@ -4,19 +4,33 @@ import uuid
 from fastapi import APIRouter, HTTPException, Request
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from app import db
+from app.auth import CurrentUser
 from app.schemas import ChatRequest, ChatResponse
 
 router = APIRouter()
 
 
 @router.post("/chat", response_model=ChatResponse)
-def chat(req: ChatRequest, request: Request) -> ChatResponse:
+def chat(req: ChatRequest, request: Request, user=CurrentUser) -> ChatResponse:
     graph = request.app.state.graph
     system_prompt = request.app.state.system_prompt
 
-    thread_id = req.thread_id or uuid.uuid4().hex
-    config = {"configurable": {"thread_id": thread_id}}
+    # 线程归属：已有会话校验归属（404/403）；新会话由服务端生成 thread_id 并绑定用户
+    if req.thread_id:
+        thread = db.get_thread(request.app.state.pool, req.thread_id)
+        if thread is None:
+            raise HTTPException(status_code=404, detail="会话不存在")
+        if thread["user_id"] != user["id"]:
+            raise HTTPException(status_code=403, detail="无权访问该会话")
+        thread_id = req.thread_id
+    else:
+        thread_id = uuid.uuid4().hex
+        db.create_thread(request.app.state.pool, thread_id, user["id"])
+
+    config = {"configurable": {"thread_id": thread_id, "user_id": str(user["id"])}}
     request.state.thread_id = thread_id  # 捎带给 exception_handler 做日志关联
+    request.state.user_id = str(user["id"])
 
     # 已有会话 → 读取快照判断状态（挂起中 / 已完成 / 不存在）
     snapshot = graph.get_state(config) if req.thread_id else None

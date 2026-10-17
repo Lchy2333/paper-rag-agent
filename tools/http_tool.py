@@ -32,20 +32,26 @@ class HttpTool(ToolBase):
             },
         }
 
-    def execute(self, args: Dict[str, Any]) -> ToolResult:
+    def execute(self, args: Dict[str, Any], user_id: str | None = None) -> ToolResult:
+        """执行工具。user_id 由 Dispatcher 从认证上下文注入（LLM 不可见、不可伪造），
+        作为 X-User-ID 头传给 RAG（多用户文档隔离）。"""
         path = self.config["path"]
         method = self.config.get("method", "GET").upper()
 
         # 路径参数替换：/documents/:id -> /documents/{id}
         url, body_args = self._build_url(path, args)
 
+        headers = {}
+        if user_id:
+            headers["X-User-ID"] = user_id
+
         # 网络错误（超时/连接/HTTP 状态/非 JSON 响应）直接抛出，
         # 由 Dispatcher 的 retry_call 统一判定瞬态错误并重试。
         start = time.time()
         if method == "GET":
-            resp = self.session.get(url, params=body_args, timeout=30)
+            resp = self.session.get(url, params=body_args, headers=headers, timeout=30)
         else:
-            resp = self.session.request(method, url, json=body_args, timeout=30)
+            resp = self.session.request(method, url, json=body_args, headers=headers, timeout=30)
         resp.raise_for_status()
         return ToolResult(success=True, data=resp.json(), latency_ms=(time.time() - start) * 1000)
 
