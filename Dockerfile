@@ -13,5 +13,6 @@ COPY --from=deps /usr/local/bin /usr/local/bin
 COPY . .
 
 EXPOSE 8001
-# 多 worker：PostgresSaver 共享 DB（架构支持多副本），LLMHealthTracker 进程内单例（可接受）
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8001", "--workers", "2"]
+# 单 worker：多 worker 并发 PostgresSaver.setup() 会撞表冲突；
+# agent 是 I/O 等待型（等 LLM），单 worker + FastAPI 异步已够用
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8001", "--workers", "1"]
