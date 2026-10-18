@@ -20,10 +20,12 @@ from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
 from agent.graph import build_graph
-from app.api import approve, auth, chat, threads
+from app.api import approve, auth, chat, documents, health, llm_check, threads
 from app.config import settings
 from app.errors import classify_exception
 from core import Dispatcher, ToolRegistry
+from core.llm_probe import LLMHealthTracker
+from core.rag_proxy import RagProxy
 from tools.http_tool import HttpTool
 
 sys.stdout.reconfigure(encoding="utf-8")
@@ -49,9 +51,9 @@ def build_agent():
 
     dispatcher = Dispatcher(registry)
     llm = ChatOpenAI(
-        base_url=settings.ark_base_url,
-        api_key=settings.ark_api_key,
-        model=settings.ark_model,
+        base_url=settings.llm_base_url,
+        api_key=settings.llm_api_key,
+        model=settings.llm_model,
     )
     # checkpointer 是 HITL 中断恢复 + 多轮会话的存档仓库；
     # 生产用 Postgres 持久化（独立库 paper_rag_agent），多副本共享会话状态，
@@ -65,17 +67,27 @@ def build_agent():
     pool.open()
     checkpointer = PostgresSaver(pool)
     checkpointer.setup()  # 自动建 checkpoints / checkpoint_blobs / checkpoint_writes
-    graph = build_graph(llm, dispatcher, checkpointer)
-    return llm, dispatcher, graph, pool
+    # LLM 健康跟踪器：call_llm 记录真实调用成败 → /health 被动信号（零额外请求）
+    llm_tracker = LLMHealthTracker()
+    graph = build_graph(llm, dispatcher, checkpointer, llm_tracker=llm_tracker)
+    # 文档管理转发器（BFF）：前端经 agent 中转访问 RAG，可信身份 + 服务端持有 API Key。
+    # 复用同一个 session（已带 X-API-Key 默认头），rag_api_key 单独传入供显式引用。
+    rag_proxy = RagProxy(session, settings.rag_base_url, settings.rag_api_key)
+    return llm, dispatcher, graph, pool, rag_proxy, llm_tracker
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    llm, dispatcher, graph, pool = build_agent()
+    # 启动校验：付费资源 / 生产关键配置缺失 → 拒绝启动（见 app/config.py）
+    settings.ensure_runtime()
+    llm, dispatcher, graph, pool, rag_proxy, llm_tracker = build_agent()
     app.state.llm = llm
     app.state.dispatcher = dispatcher
     app.state.graph = graph
     app.state.pool = pool
+    app.state.rag_proxy = rag_proxy
+    app.state.llm_tracker = llm_tracker
+    app.state.settings = settings
     app.state.system_prompt = settings.system_prompt
     try:
         yield
@@ -88,6 +100,9 @@ app.include_router(auth.router, prefix="/api", tags=["auth"])
 app.include_router(chat.router, prefix="/api", tags=["chat"])
 app.include_router(approve.router, prefix="/api", tags=["chat"])
 app.include_router(threads.router, prefix="/api", tags=["threads"])
+app.include_router(documents.router, tags=["documents"])
+app.include_router(health.router)
+app.include_router(llm_check.router)
 
 
 @app.exception_handler(Exception)
@@ -113,8 +128,3 @@ async def uncaught_exception_handler(request: Request, exc: Exception):
         status_code=status,
         content={"status": "error", "error_code": code, "message": message},
     )
-
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}

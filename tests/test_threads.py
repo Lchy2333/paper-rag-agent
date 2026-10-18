@@ -78,7 +78,7 @@ class _FakePool:
 @pytest.fixture()
 def ctx(monkeypatch):
     """app + 假 build_agent + FakeGraph；graph 挂在 app.state 供路由使用。"""
-    monkeypatch.setattr("app.main.build_agent", lambda: (None, None, None, _FakePool()))
+    monkeypatch.setattr("app.main.build_agent", lambda: (None, None, None, _FakePool(), None, None))
     g = _FakeGraph()
     with TestClient(app) as c:
         app.state.graph = g

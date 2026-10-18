@@ -32,7 +32,7 @@ def client(monkeypatch):
         def close(self):
             pass
 
-    monkeypatch.setattr("app.main.build_agent", lambda: (None, None, None, _FakePool()))
+    monkeypatch.setattr("app.main.build_agent", lambda: (None, None, None, _FakePool(), None, None))
     monkeypatch.setattr(settings, "jwt_secret", TEST_SECRET)
     monkeypatch.setattr(settings, "jwt_expire_minutes", 60)
     with TestClient(app) as c:

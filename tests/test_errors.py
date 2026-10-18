@@ -65,7 +65,7 @@ def client(monkeypatch):
             pass
 
     def fake_build_agent():
-        return None, None, None, _FakePool()  # llm, dispatcher, graph, pool
+        return None, None, None, _FakePool(), None, None  # llm, dispatcher, graph, pool, rag_proxy, llm_tracker
 
     monkeypatch.setattr("app.main.build_agent", fake_build_agent)
     # 覆盖认证依赖：错误分类测试不关心鉴权，直接以假用户身份放行

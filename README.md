@@ -3,27 +3,33 @@
 学术论文检索 + RAG agent：**FastAPI + LangGraph** 服务。
 
 由 paper-rag-agent-MVP 升级而来：自研 StateGraph 引擎替换为官方 `langgraph`，新增 FastAPI 服务层。
-已落地**多用户隔离 + 对话持久化**（PostgreSQL checkpointer + JWT 认证 + 线程归属绑定）。
+已落地**多用户隔离 + 对话持久化**（PostgreSQL checkpointer + JWT 认证 + 线程归属绑定）+ **BFF 文档管理转发**（前端经 agent 中转访问 RAG）。
 
 ## 项目结构
 
 ```
 app/                  # FastAPI 服务层
   main.py               # 应用入口：lifespan 构建 graph / PostgresSaver / 挂路由
-  config.py             # pydantic-settings 读 .env（含 DATABASE_URL / JWT_SECRET）
+  config.py             # pydantic-settings 读 .env（含 LLM_* / DATABASE_URL / JWT_SECRET，带启动校验）
   schemas.py            # Pydantic 请求/响应模型
   auth.py               # bcrypt 密码哈希 + JWT 签发/验签 + get_current_user 依赖
   db.py                 # users / threads / audit_logs 仓储
+  errors.py             # 异常分类（LLM 错误 → 502/429/500 语义化响应）
   api/chat.py           # POST /chat（认证 + 线程归属校验）
   api/approve.py        # POST /approve（HITL 审批，归属校验 + 审计）
   api/auth.py           # POST /auth/register / /auth/login
   api/threads.py        # GET/PATCH/DELETE /threads（列表 / 改名 / 置顶 / 删除）
+  api/documents.py      # 文档管理转发（BFF：前端经 agent 中转 RAG，可信身份注入 + 删除审计）
+  api/health.py         # GET /health（分层：status 存活 / checks 就绪）
+  api/llm_check.py      # POST /api/llm/check（LLM 就绪验证，BYOK 复用）
 agent/                # LangGraph 层
   state.py              # AgentState（messages / route 通道）
-  nodes.py              # call_llm / call_tool / guard_node（审批）
+  nodes.py              # call_llm / call_tool / guard_node（审批；call_llm 记录 LLM 健康被动信号）
   graph.py              # 官方 StateGraph 组装 ReAct 图（含 HITL 护栏）
 core/                 # 核心抽象层（与业务无关）
   tool.py / registry.py / dispatcher.py / retry.py
+  rag_proxy.py          # BFF 转发器：注入可信 X-User-ID + X-API-Key，上传大超时
+  llm_probe.py          # LLM 就绪探针（max_tokens=1）+ 被动信号 tracker
 tools/                # 具体工具
   RAGtools.json         # RAG 接口声明（一个接口 = 一段配置）
   http_tool.py          # 通用 HTTP 工具（自动注入 X-User-ID 头）
@@ -46,12 +52,19 @@ START → call_llm ──(有 tool_calls)──► guard ──(approve/noop)─
           ├─ /auth/register · /auth/login   → 签发 JWT
           ├─ get_current_user               → 验签得 user_id（可信）
           ├─ /chat · /approve · /threads    → threads 归属校验（越权 403）
+          ├─ /api/documents/*               → BFF 转发 RAG（可信身份 + 服务端持有 API Key）
+          ├─ /health                        → 分层健康检查（status 存活 / checks 就绪）
+          ├─ /api/llm/check                 → LLM 就绪验证（BYOK 复用）
           ├─ PostgresSaver                  → 对话落盘（库 paper_rag_agent）
           └─ HttpTool → X-API-Key + X-User-ID
                 │
                 ▼
         RAG 服务（Go）：UserContext 读 X-User-ID → 文档级隔离
 ```
+
+> **BFF 原则**：前端只连 Agent（唯一入口）。文档管理经 `/api/documents/*` 由 Agent 转发到 RAG，
+> `X-User-ID` 从 JWT 验签得到（前端无法伪造）、`X-API-Key` 只在 Agent 进程持有（浏览器不可见）。
+> 前端健康状态也读 Agent `/health` 的 `checks`，不直连 RAG（见 `app/api/health.py`）。
 
 ## 快速开始
 
@@ -67,21 +80,27 @@ START → call_llm ──(有 tool_calls)──► guard ──(approve/noop)─
 
 ```bash
 copy .env.example .env
-# 必填：ARK_API_KEY、DATABASE_URL、JWT_SECRET
+# 必填：LLM_BASE_URL / LLM_API_KEY / LLM_MODEL、DATABASE_URL、JWT_SECRET
 ```
 
 关键项：
 
 ```
-ARK_BASE_URL=https://ark.cn-beijing.volces.com/api/plan/v3/
-ARK_API_KEY=your-ark-api-key
-ARK_MODEL=deepseek-v4-flash
+# 环境标识：dev（仅告警缺失）/ prod（关键配置缺失拒绝启动）
+APP_ENV=dev
+# LLM 接入（OpenAI 兼容协议，可指向任意兼容服务：火山方舟 / DeepSeek / OpenAI…）
+LLM_BASE_URL=https://ark.cn-beijing.volces.com/api/plan/v3/
+LLM_API_KEY=your-llm-api-key
+LLM_MODEL=deepseek-v4-flash
 RAG_BASE_URL=http://localhost:8080
 RAG_API_KEY=your-rag-api-key
 DATABASE_URL=postgresql://postgres:密码@localhost:5432/paper_rag_agent
 JWT_SECRET=<随机串，python -c "import secrets; print(secrets.token_urlsafe(48))">
 JWT_EXPIRE_MINUTES=10080
 ```
+
+> ⚠️ **启动校验**（`app/config.py` `ensure_runtime()`）：LLM 三要素（base_url/api_key/model）缺失 → 拒绝启动；
+> `APP_ENV=prod` 时 JWT_SECRET / RAG_API_KEY / 生产库缺失也拒绝启动。密钥一律零默认值，不提供兜底 key。
 
 ### 3. 创建用户并启动
 
@@ -103,7 +122,7 @@ pytest tests\ -v
 
 | 端点 | 方法 | 认证 | 说明 |
 |---|---|---|---|
-| `/health` | GET | 无 | 健康检查 |
+| `/health` | GET | 无 | 分层健康检查：`status`（存活=agent+db）供编排 / `checks`（db/rag/llm 就绪）供前端 |
 | `/api/auth/register` | POST | 无 | 注册（201 / 409 / 422） |
 | `/api/auth/login` | POST | 无 | 登录 → JWT（200 / 401 / 403） |
 | `/api/chat` | POST | Bearer | 对话（新会话 / 续聊 / 审批挂起） |
@@ -111,6 +130,12 @@ pytest tests\ -v
 | `GET /api/threads` | GET | Bearer | 列自己的会话（置顶优先） |
 | `PATCH /api/threads/{id}` | PATCH | Bearer | 改名 / 置顶 |
 | `DELETE /api/threads/{id}` | DELETE | Bearer | 删除会话（连带对话快照） |
+| `GET /api/documents` | GET | Bearer | 文档列表（BFF 转发 RAG） |
+| `POST /api/documents` | POST | Bearer | 上传 PDF（BFF 转发，大超时；RAG 异步摄入） |
+| `GET /api/documents/{id}` | GET | Bearer | 文档详情（BFF 转发） |
+| `POST /api/documents/{id}/rechunk` | POST | Bearer | 重新分块（BFF 转发） |
+| `DELETE /api/documents/{id}` | DELETE | Bearer | 删除文档（BFF 转发 + 审计留痕） |
+| `POST /api/llm/check` | POST | Bearer | LLM 就绪验证（BYOK：用户自测 base_url/api_key/model） |
 
 **认证方式**：所有业务接口需 `Authorization: Bearer <JWT>` 头；JWT 由 `/api/auth/login` 签发。
 
