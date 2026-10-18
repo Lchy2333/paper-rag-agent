@@ -7,6 +7,7 @@
 """
 import pytest
 from fastapi.testclient import TestClient
+import io
 
 from app import db
 from app.auth import get_current_user
@@ -127,3 +128,34 @@ def test_rag_unreachable_502(fake_env):
     r = client.get("/api/documents")
     assert r.status_code == 502
     assert r.json()["detail"] == "无法连接 RAG 服务"
+
+
+def test_upload_requires_field_name_file(fake_env):
+    """前端 FormData 字段名是 `file`（与 RAG 侧 form.File["file"] 一致）。
+
+    回归：参数曾误命名 `files`，FastAPI 按参数名匹配 multipart 字段 → 422。
+    字段名必须叫 `file`，否则前端上传直接 422 Unprocessable Entity。
+    """
+    client, proxy, _ = fake_env
+    proxy.responses[("POST", "/api/v1/documents")] = {
+        "success_count": 1, "duplicate_count": 0, "failed_count": 0, "results": []
+    }
+
+    pdf = b"%PDF-1.4 fake pdf content"
+    # 正确字段名 file
+    r = client.post(
+        "/api/documents",
+        files=[("file", ("paper.pdf", io.BytesIO(pdf), "application/pdf"))],
+    )
+    assert r.status_code == 200
+    assert proxy.calls[-1]["method"] == "POST"
+    assert proxy.calls[-1]["user_id"] == "11111111-2222-3333-4444-555555555555"
+    # 字段名必须叫 file：转发到 RAG 的 files 结构第一项 field_name 也是 file
+    assert proxy.calls[-1]["files"][0][0] == "file"
+
+    # 错误字段名 files（老 bug）：应 422 校验失败
+    r_bad = client.post(
+        "/api/documents",
+        files=[("files", ("paper.pdf", io.BytesIO(pdf), "application/pdf"))],
+    )
+    assert r_bad.status_code == 422

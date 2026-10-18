@@ -58,14 +58,16 @@ def list_documents(request: Request, user=CurrentUser):
 
 
 @router.post("")
-async def upload_documents(request: Request, files: list[UploadFile], user=CurrentUser):
+async def upload_documents(request: Request, file: list[UploadFile], user=CurrentUser):
     """上传 PDF（一个或多个，multipart 字段名 file）。可选分块参数经 form 字段传入。
 
     RAG 为异步摄入：本接口只做接收段（秒回），处理进度由前端轮询文档详情。
+    注意：参数名固定为 `file`（FastAPI 用参数名匹配 multipart 字段名），
+    与前端 FormData 的字段名、RAG 侧 `form.File["file"]` 契约一致。
     """
     # 构造 requests 的 files 结构：(field_name, (filename, fileobj, content_type))
     rag_files = []
-    for f in files:
+    for f in file:
         content = await f.read()
         rag_files.append(("file", (f.filename or "upload.pdf", content, f.content_type or "application/pdf")))
 
