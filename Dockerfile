@@ -3,7 +3,8 @@
 FROM python:3.12-slim AS deps
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# 国内 PyPI 镜像（pypi.org 在国内慢/不稳定）
+RUN pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple/ -r requirements.txt
 
 FROM python:3.12-slim AS runtime
 WORKDIR /app
