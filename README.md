@@ -5,6 +5,9 @@
 由 paper-rag-agent-MVP 升级而来：自研 StateGraph 引擎替换为官方 `langgraph`，新增 FastAPI 服务层。
 已落地**多用户隔离 + 对话持久化**（PostgreSQL checkpointer + JWT 认证 + 线程归属绑定）+ **BFF 文档管理转发**（前端经 agent 中转访问 RAG）。
 
+> **生产部署**：已容器化（`Dockerfile`，单 worker）。完整编排（postgres + rag + agent + fronted）
+> 在 [paper-rag-deploy](https://github.com/Lchy2333/paper-rag-deploy) 仓，`docker compose up -d --build` 一键拉起。
+
 ## 项目结构
 
 ```
