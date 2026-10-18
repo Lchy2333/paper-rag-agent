@@ -21,23 +21,31 @@ from core.retry import is_transient, retry_call
 logger = logging.getLogger(__name__)
 
 
-def call_llm(llm, dispatcher: Dispatcher) -> Callable:
+def call_llm(llm, dispatcher: Dispatcher, tracker=None) -> Callable:
     """节点：调 LLM，返回 assistant 消息（有 tool_calls 时带上）。
 
     llm 是 langchain_openai.ChatOpenAI 实例。
     bind_tools 把工具 schema 绑到模型；invoke 直接收 LangChain 消息、返回 AIMessage。
     LLM 调用包一层 retry_call：ARK 超时/限流/5xx 等瞬态失败指数退避重试（最多 3 次），
     复用 dispatcher.sleep（测试可注入 no-op）。
+    tracker（core.llm_probe.LLMHealthTracker）：记录真实调用成败 → /health 被动信号。
     """
     def node(state: Dict[str, Any]) -> Dict[str, Any]:
         llm_with_tools = llm.bind_tools(dispatcher.registry.list_schemas())
-        response = retry_call(
-            lambda: llm_with_tools.invoke(state["messages"]),
-            retryable=is_transient,
-            max_attempts=3,
-            jitter_ratio=0.1,
-            sleep=dispatcher.sleep,
-        )
+        try:
+            response = retry_call(
+                lambda: llm_with_tools.invoke(state["messages"]),
+                retryable=is_transient,
+                max_attempts=3,
+                jitter_ratio=0.1,
+                sleep=dispatcher.sleep,
+            )
+        except Exception as e:
+            if tracker is not None:
+                tracker.record_failure(str(e))
+            raise
+        if tracker is not None:
+            tracker.record_success()
         logger.info("llm_response: %s", response)
         return {"messages": [response]}
 

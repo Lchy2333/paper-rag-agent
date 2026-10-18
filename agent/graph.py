@@ -27,10 +27,10 @@ from agent.nodes import (
 from agent.state import AgentState
 
 
-def build_graph(llm, dispatcher, checkpointer=None) -> CompiledStateGraph:
+def build_graph(llm, dispatcher, checkpointer=None, llm_tracker=None) -> CompiledStateGraph:
     graph = StateGraph(AgentState)
 
-    graph.add_node("call_llm", call_llm(llm, dispatcher))
+    graph.add_node("call_llm", call_llm(llm, dispatcher, tracker=llm_tracker))
     graph.add_node("guard", guard_node(dispatcher))
     graph.add_node("call_tool", call_tool(dispatcher))
 
