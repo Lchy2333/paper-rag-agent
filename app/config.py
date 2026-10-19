@@ -49,6 +49,9 @@ class Settings(BaseSettings):
     jwt_secret: str = ""  # 空密钥 = 任何人可伪造 token，必配
     jwt_expire_minutes: int = 10080
 
+    # 新用户注册开关：false = 暂时关闭公开注册（登录不受影响，已有用户可正常使用）
+    registration_enabled: bool = True
+
     # 工具配置
     tools_config: Path = PROJECT_ROOT / "tools" / "RAGtools.json"
 

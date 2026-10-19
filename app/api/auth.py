@@ -11,6 +11,7 @@ from fastapi import APIRouter, HTTPException, Request
 
 from app import db
 from app.auth import create_access_token, hash_password, verify_password
+from app.config import settings
 from app.schemas import LoginRequest, RegisterRequest, TokenResponse, UserOut
 
 logger = logging.getLogger(__name__)
@@ -20,6 +21,10 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 @router.post("/register", response_model=UserOut, status_code=201)
 def register(req: RegisterRequest, request: Request) -> UserOut:
+    if not settings.registration_enabled:
+        # 开关关闭：公开注册暂停，账号只能由管理员直接插库创建
+        raise HTTPException(status_code=403, detail="注册已关闭，请联系管理员开通账号")
+
     if db.get_user_by_username(request.app.state.pool, req.username):
         raise HTTPException(status_code=409, detail="用户名已存在")
 

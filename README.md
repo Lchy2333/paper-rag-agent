@@ -126,7 +126,7 @@ pytest tests\ -v
 | 端点 | 方法 | 认证 | 说明 |
 |---|---|---|---|
 | `/health` | GET | 无 | 分层健康检查：`status`（存活=agent+db）供编排 / `checks`（db/rag/llm 就绪）供前端 |
-| `/api/auth/register` | POST | 无 | 注册（201 / 409 / 422） |
+| `/api/auth/register` | POST | 无 | 注册（201 / 403 / 409 / 422；`REGISTRATION_ENABLED=false` 时 403 关闭） |
 | `/api/auth/login` | POST | 无 | 登录 → JWT（200 / 401 / 403） |
 | `/api/chat` | POST | Bearer | 对话（新会话 / 续聊 / 审批挂起） |
 | `/api/approve` | POST | Bearer | HITL 审批（越权 403 / 不存在 404） |

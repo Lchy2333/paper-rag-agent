@@ -67,6 +67,22 @@ def test_register_validation_error(client):
     assert r.status_code == 422  # 长度校验失败走 FastAPI 内置 422
 
 
+def test_register_disabled(client, monkeypatch):
+    monkeypatch.setattr(settings, "registration_enabled", False)
+    r = client.post("/api/auth/register", json={"username": "alice", "password": "secret123"})
+    assert r.status_code == 403
+    assert "注册已关闭" in r.json()["detail"]
+
+
+def test_login_still_works_when_registration_disabled(client, monkeypatch):
+    """注册关闭不影响已有用户登录。"""
+    monkeypatch.setattr(settings, "registration_enabled", False)
+    monkeypatch.setattr("app.db.get_user_by_username", lambda pool, u: FAKE_USER)
+    monkeypatch.setattr("app.api.auth.verify_password", lambda p, h: True)
+    r = client.post("/api/auth/login", json={"username": "admin", "password": "Lucifer49368293!"})
+    assert r.status_code == 200
+
+
 # ---------- 登录 ----------
 
 def test_login_ok_returns_jwt(client, monkeypatch):
