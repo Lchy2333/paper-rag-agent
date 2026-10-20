@@ -22,6 +22,10 @@ class ApproveRequest(BaseModel):
     approved: bool = Field(..., description="是否允许该操作")
 
 
+class CancelRequest(BaseModel):
+    thread_id: str = Field(..., description="要中断生成会话的 thread_id")
+
+
 class RegisterRequest(BaseModel):
     username: str = Field(..., min_length=3, max_length=64, description="用户名")
     password: str = Field(..., min_length=8, max_length=64, description="密码")
