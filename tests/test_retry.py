@@ -9,7 +9,7 @@
 import openai
 import pytest
 import requests
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
 
 from agent.nodes import call_llm
 from core import Dispatcher, ToolRegistry
@@ -99,7 +99,7 @@ def test_retry_call_gives_up_after_max_attempts():
 # ---------- L1：LLM 调用重试 ----------
 
 class _FlakyLLM:
-    """模拟 ChatOpenAI：前 N 次 invoke 抛瞬态异常，之后返回正常回复。"""
+    """模拟 ChatOpenAI：前 N 次 stream 抛瞬态异常，之后返回正常回复。"""
 
     def __init__(self, fail_times, reply, exc):
         self.fail_times = fail_times
@@ -110,11 +110,11 @@ class _FlakyLLM:
     def bind_tools(self, tools):
         return self
 
-    def invoke(self, messages):
+    def stream(self, messages):
         self.calls += 1
         if self.calls <= self.fail_times:
-            raise self.exc
-        return self.reply
+            raise self.exc  # 在吐出任何 token 之前失败 → 允许重试
+        yield AIMessageChunk(content=self.reply.content)
 
 
 class _EchoTool(ToolBase):

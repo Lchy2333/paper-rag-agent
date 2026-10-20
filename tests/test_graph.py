@@ -5,7 +5,7 @@
 """
 import json
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, SystemMessage
 from langgraph.graph import END
 
 from agent.graph import build_graph
@@ -36,7 +36,7 @@ class _EchoTool(ToolBase):
 
 
 class FakeLLM:
-    """模拟 ChatOpenAI：bind_tools 记录 schema，invoke 返回预设的 AIMessage 序列。"""
+    """模拟 ChatOpenAI：bind_tools 记录 schema，invoke/stream 返回预设的 AIMessage 序列。"""
 
     def __init__(self, replies):
         # replies: list of AIMessage，按调用顺序逐个返回
@@ -51,6 +51,12 @@ class FakeLLM:
     def invoke(self, messages):
         self.calls.append({"messages": messages, "tools": self.last_bound_tools})
         return self._replies.pop(0)
+
+    def stream(self, messages):
+        self.calls.append({"messages": messages, "tools": self.last_bound_tools})
+        reply = self._replies.pop(0)
+        # 模拟流式：整段回复作为一个 chunk 吐出来（保留 tool_calls，供路由判断）
+        yield AIMessageChunk(content=reply.content, tool_calls=reply.tool_calls)
 
 
 def _tool_call_message(name: str, args: dict) -> AIMessage:

@@ -121,6 +121,8 @@
         "description": "在论文库中检索相关片段，返回结构化chunks（不调LLM生成答案），供Agent自拼上下文回答",
         "path": "/api/v1/search",
         "method": "POST",
+        "streaming": true,
+        "timeout": 90,
         "schema": {
             "type": "object",
             "properties": {

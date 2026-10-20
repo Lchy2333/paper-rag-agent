@@ -1,3 +1,4 @@
+import inspect
 import json
 import time
 from typing import TYPE_CHECKING
@@ -16,7 +17,8 @@ class Dispatcher:
         self.registry = registry
         self.sleep = sleep
 
-    def dispatch(self, tool_name: str, args_json: str, user_id: str | None = None) -> ToolResult:
+    def dispatch(self, tool_name: str, args_json: str, user_id: str | None = None,
+                 on_event=None) -> ToolResult:
         try:
             args = json.loads(args_json) if args_json else {}
         except json.JSONDecodeError as e:
@@ -28,8 +30,12 @@ class Dispatcher:
 
         start = time.time()
         try:
+            # on_event 仅当工具声明该参数时才传（旧工具/测试工具不声明，保持兼容）
+            tool_kwargs = {}
+            if on_event is not None and _supports_on_event(tool):
+                tool_kwargs["on_event"] = on_event
             tool_result = retry_call(
-                lambda: tool.execute(args, user_id=user_id),
+                lambda: tool.execute(args, user_id=user_id, **tool_kwargs),
                 retryable=is_transient,
                 max_attempts=3,
                 jitter_ratio=0.1,
@@ -40,3 +46,11 @@ class Dispatcher:
 
         tool_result.latency_ms = (time.time() - start) * 1000
         return tool_result
+
+
+def _supports_on_event(tool) -> bool:
+    """工具是否声明了 on_event 参数（流式进度回调）。"""
+    try:
+        return "on_event" in inspect.signature(tool.execute).parameters
+    except (TypeError, ValueError):
+        return False

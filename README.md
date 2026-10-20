@@ -48,6 +48,26 @@ START → call_llm ──(有 tool_calls)──► guard ──(approve/noop)─
               └─────(无 tool_calls)────────────────────► END
 ```
 
+## 流式对话与随时停止（SSE，2026-10 上线）
+
+前端对话走 **`POST /api/chat/stream`**（SSE 流式），后端把图执行过程实时推给浏览器，不再"憋一口气回答完"：
+
+```
+event: session  → 会话 ID（最先发；新会话前端据此才能调用取消）
+event: stage    → 阶段进度（"正在理解问题…""检索中 · 向量化…""检索完成 · 命中 N 条"）
+event: token    → 最终回答逐字输出（打字机效果）
+event: approval → HITL 挂起，等待审批
+event: cancel   → 用户主动停止（前端 POST /chat/cancel 触发）
+event: done     → 正常跑完
+event: error    → 执行失败
+```
+
+- **三种事件源**：`graph.stream(stream_mode=["values","custom","messages"])`——`custom`（节点/工具插桩的阶段进度）、`messages`（LLM 逐字 token）、`values`（检测审批挂起）。
+- **节点插桩**：`call_llm` / `call_tool` 用 `get_stream_writer()` 发阶段事件；`HttpTool` 消费 RAG 的 `/search` SSE 进度（`search_rag` 标记 `"streaming": true`）。
+- **用同步 `graph.stream` 而非 `astream`**：`PostgresSaver` 只实现了同步 checkpoint 方法，`astream` 会抛 `NotImplementedError`（已在 `/chat/stream` 注释说明）。
+- **随时停止**：`call_llm` 改用 `llm.stream()` 逐字生成，每个 token 前检查取消开关（`threading.Event`）；`/chat/cancel` 置位开关 → 节点抛 `GenerationCancelled` → 流以 `event: cancel` 收尾。停止粒度 = 一个 token。
+- 原 `/api/chat`（一次性 JSON）保留做兼容/兜底。
+
 ## 架构总览
 
 ```
@@ -128,7 +148,9 @@ pytest tests\ -v
 | `/health` | GET | 无 | 分层健康检查：`status`（存活=agent+db）供编排 / `checks`（db/rag/llm 就绪）供前端 |
 | `/api/auth/register` | POST | 无 | 注册（201 / 403 / 409 / 422；`REGISTRATION_ENABLED=false` 时 403 关闭） |
 | `/api/auth/login` | POST | 无 | 登录 → JWT（200 / 401 / 403） |
-| `/api/chat` | POST | Bearer | 对话（新会话 / 续聊 / 审批挂起） |
+| `/api/chat` | POST | Bearer | 对话（新会话 / 续聊 / 审批挂起）——一次性返回，兼容/兜底 |
+| `/api/chat/stream` | POST | Bearer | **流式对话（SSE）**：阶段进度 + 逐字回答 + 审批挂起 + 随时停止 |
+| `/api/chat/cancel` | POST | Bearer | **中断**指定会话正在进行的生成（幂等，归属校验） |
 | `/api/approve` | POST | Bearer | HITL 审批（越权 403 / 不存在 404） |
 | `GET /api/threads` | GET | Bearer | 列自己的会话（置顶优先） |
 | `PATCH /api/threads/{id}` | PATCH | Bearer | 改名 / 置顶 |
@@ -148,8 +170,14 @@ curl -s -X POST http://localhost:8001/api/auth/login \
   -H "Content-Type: application/json" \
   -d '{"username":"admin","password":"..."}'
 
-# 2. 带 token 对话
+# 2. 带 token 对话（一次性返回，兼容）
 curl -s -X POST http://localhost:8001/api/chat \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <token>" \
+  -d '{"query":"当前数据库中有哪些已向量化的文档？"}'
+
+# 3. 流式对话（SSE：-N 关闭缓冲，看阶段进度 + 逐字回答）
+curl -N -X POST http://localhost:8001/api/chat/stream \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer <token>" \
   -d '{"query":"当前数据库中有哪些已向量化的文档？"}'

@@ -3,7 +3,7 @@
 覆盖：guard 挂起 / approve 放行 / reject 阻止 / 只读工具不挂起 /
 get_state 检测挂起状态 / guard 路由映射。全部用假对象，不依赖真实网络与 LLM。
 """
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import Command
 
@@ -27,6 +27,11 @@ class _FakeLLM:
     def invoke(self, messages):
         self.calls.append(messages)
         return self._replies.pop(0)
+
+    def stream(self, messages):
+        self.calls.append(messages)
+        reply = self._replies.pop(0)
+        yield AIMessageChunk(content=reply.content, tool_calls=reply.tool_calls)
 
 
 def _tool_call(name, args):

@@ -89,6 +89,8 @@ async def lifespan(app: FastAPI):
     app.state.llm_tracker = llm_tracker
     app.state.settings = settings
     app.state.system_prompt = settings.system_prompt
+    # 进程内"取消生成"注册表：thread_id → threading.Event（/chat/stream 创建，/chat/cancel 置位）
+    app.state.cancels = {}
     try:
         yield
     finally:
