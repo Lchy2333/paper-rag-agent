@@ -16,7 +16,7 @@ app/                  # FastAPI 服务层
   config.py             # pydantic-settings 读 .env（含 LLM_* / DATABASE_URL / JWT_SECRET，带启动校验）
   schemas.py            # Pydantic 请求/响应模型
   auth.py               # bcrypt 密码哈希 + JWT 签发/验签 + get_current_user 依赖
-  db.py                 # users / threads / audit_logs 仓储
+  db.py                 # users / threads / audit_logs / query_usage 仓储
   errors.py             # 异常分类（LLM 错误 → 502/429/500 语义化响应）
   api/chat.py           # POST /chat（认证 + 线程归属校验）
   api/approve.py        # POST /approve（HITL 审批，归属校验 + 审计）
@@ -33,10 +33,11 @@ core/                 # 核心抽象层（与业务无关）
   tool.py / registry.py / dispatcher.py / retry.py
   rag_proxy.py          # BFF 转发器：注入可信 X-User-ID + X-API-Key，上传大超时
   llm_probe.py          # LLM 就绪探针（max_tokens=1）+ 被动信号 tracker
+  usage.py              # token 用量统计（UsageCallbackHandler，callback 采集，节点零改动）
 tools/                # 具体工具
   RAGtools.json         # RAG 接口声明（一个接口 = 一段配置）
   http_tool.py          # 通用 HTTP 工具（自动注入 X-User-ID 头）
-migrations/           # 数据库迁移脚本（001 建表 / 002 置顶列）
+migrations/           # 数据库迁移脚本（001 建表 / 002 置顶列 / 003 用量表）
 tests/                # 测试
 ```
 
@@ -54,6 +55,7 @@ START → call_llm ──(有 tool_calls)──► guard ──(approve/noop)─
 
 ```
 event: session  → 会话 ID（最先发；新会话前端据此才能调用取消）
+event: usage    → token 用量快照（请求开始推基线，之后每轮 LLM 调用结束推一次）
 event: stage    → 阶段进度（"正在理解问题…""检索中 · 向量化…""检索完成 · 命中 N 条"）
 event: token    → 最终回答逐字输出（打字机效果）
 event: approval → HITL 挂起，等待审批
@@ -66,6 +68,7 @@ event: error    → 执行失败
 - **节点插桩**：`call_llm` / `call_tool` 用 `get_stream_writer()` 发阶段事件；`HttpTool` 消费 RAG 的 `/search` SSE 进度（`search_rag` 标记 `"streaming": true`）。
 - **用同步 `graph.stream` 而非 `astream`**：`PostgresSaver` 只实现了同步 checkpoint 方法，`astream` 会抛 `NotImplementedError`（已在 `/chat/stream` 注释说明）。
 - **随时停止**：`call_llm` 改用 `llm.stream()` 逐字生成，每个 token 前检查取消开关（`threading.Event`）；`/chat/cancel` 置位开关 → 节点抛 `GenerationCancelled` → 流以 `event: cancel` 收尾。停止粒度 = 一个 token。
+- **Token 用量统计（2026-10）**：`core/usage.py` 的 `UsageCallbackHandler` 挂 `config["callbacks"]`（节点零改动），`on_llm_end` 读 `usage_metadata` 累加（含子图内调用）；`event: usage` 载荷含 `query_total`（本次 query 增量）与 `session_total`（会话累计，基线 = SUM `query_usage` 表）。请求结束落库（`finally`，cancel/error 也落），前端消息下方 + 底部栏展示。
 - 原 `/api/chat`（一次性 JSON）保留做兼容/兜底。
 
 ## 架构总览
@@ -97,6 +100,7 @@ event: error    → 执行失败
 - 执行迁移（幂等，可重复跑）：
   - `migrations/001_init.sql`：users / threads / audit_logs
   - `migrations/002_threads_pinned.sql`：threads 加 pinned 列
+  - `migrations/003_query_usage.sql`：query_usage 表（token 用量明细，会话累计的事实源）
 - `checkpoints` 系列表由 `PostgresSaver.setup()` 启动时自动创建
 
 ### 2. 配置 .env
