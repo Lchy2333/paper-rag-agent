@@ -140,6 +140,14 @@
                         "type": "string"
                     },
                     "description": "限定检索范围，空则全库检索"
+                },
+                "hybrid": {
+                    "type": "boolean",
+                    "description": "检索通路开关：true=向量+全文混合检索（RRF融合），false=纯向量；不传则跟随服务端配置"
+                },
+                "rerank": {
+                    "type": "boolean",
+                    "description": "精排开关：true=对粗排候选做cross-encoder重排，false=跳过重排；不传则跟随服务端配置"
                 }
             },
             "required": ["query"]
