@@ -5,7 +5,7 @@
 创建）。测试时可注入假 pool 或 monkeypatch 本模块函数，无需真实数据库。
 """
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # 对外暴露的字段（绝不含 password_hash）
 PUBLIC_COLUMNS = "id, username, disabled"
@@ -118,4 +118,38 @@ def add_audit_log(
             "INSERT INTO audit_logs (user_id, thread_id, action, payload)"
             " VALUES (%s, %s, %s, %s)",
             (user_id, thread_id, action, json.dumps(payload, ensure_ascii=False, default=str)),
+        )
+
+
+# ---------- query_usage 用量仓储（会话累计的事实源，表见 003_query_usage.sql） ----------
+
+def get_session_usage(pool, thread_id: str) -> Tuple[int, int]:
+    """会话累计用量（SUM）。请求开始读一次作为本次 query 的基线。"""
+    with pool.connection() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(input_tokens), 0) AS input_tokens,"
+            " COALESCE(SUM(output_tokens), 0) AS output_tokens"
+            " FROM query_usage WHERE thread_id = %s",
+            (thread_id,),
+        ).fetchone()
+    if row is None:
+        return 0, 0
+    # pool 的 row_factory 是 dict_row（main.py），fetchone 返回字典，按列名取值
+    return row["input_tokens"], row["output_tokens"]
+
+
+def record_usage(
+    pool,
+    thread_id: str,
+    user_id: str,
+    input_tokens: int,
+    output_tokens: int,
+    calls: int,
+) -> None:
+    """每次 query 结束落一行（调用方在 finally 里调，cancel / error 也落）。"""
+    with pool.connection() as conn:
+        conn.execute(
+            "INSERT INTO query_usage (thread_id, user_id, input_tokens, output_tokens, calls)"
+            " VALUES (%s, %s, %s, %s, %s)",
+            (thread_id, user_id, input_tokens, output_tokens, calls),
         )

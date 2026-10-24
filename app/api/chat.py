@@ -13,6 +13,7 @@ from app import db
 from app.auth import CurrentUser
 from app.errors import classify_exception
 from app.schemas import CancelRequest, ChatRequest, ChatResponse
+from core.usage import UsageCallbackHandler
 
 logger = logging.getLogger(__name__)
 
@@ -46,10 +47,16 @@ def chat(req: ChatRequest, request: Request, user=CurrentUser) -> ChatResponse:
     # 线程归属：已有会话校验归属（404/403）；新会话由服务端生成 thread_id 并绑定用户
     # （与 /chat/stream 共用 _resolve_thread，逻辑一致）
     thread_id = _resolve_thread(req, request, user)
-
-    config = {"configurable": {"thread_id": thread_id, "user_id": str(user["id"])}}
     request.state.thread_id = thread_id  # 捎带给 exception_handler 做日志关联
     request.state.user_id = str(user["id"])
+
+    # 用量统计：读 session 基线 → 挂 callback（节点零改动，图内所有 LLM 调用自动累计）
+    session_in, session_out = db.get_session_usage(request.app.state.pool, thread_id)
+    usage_handler = UsageCallbackHandler(thread_id, str(user["id"]), session_in, session_out)
+    config = {
+        "configurable": {"thread_id": thread_id, "user_id": str(user["id"])},
+        "callbacks": [usage_handler],
+    }
 
     # 已有会话 → 读取快照判断状态（挂起中 / 已完成 / 不存在）
     snapshot = graph.get_state(config) if req.thread_id else None
@@ -68,6 +75,12 @@ def chat(req: ChatRequest, request: Request, user=CurrentUser) -> ChatResponse:
         msgs.insert(0, SystemMessage(content=system_prompt))
 
     result = graph.invoke({"messages": msgs}, config=config)
+
+    # 用量落库（awaiting_approval 挂起也落已完成轮次）
+    db.record_usage(request.app.state.pool, thread_id, str(user["id"]),
+                    usage_handler.usage.input_tokens,
+                    usage_handler.usage.output_tokens,
+                    usage_handler.usage.calls)
 
     if "__interrupt__" in result:
         intr = result["__interrupt__"][0]
@@ -104,11 +117,17 @@ async def chat_stream(req: ChatRequest, request: Request, user=CurrentUser):
     cancel_event = threading.Event()
     request.app.state.cancels[thread_id] = cancel_event
 
-    config = {"configurable": {
-        "thread_id": thread_id,
-        "user_id": str(user["id"]),
-        "cancel_event": cancel_event,
-    }}
+    # 用量统计：读 session 基线 → 挂 callback；gen() 里每轮推送 + finally 落库
+    session_in, session_out = db.get_session_usage(request.app.state.pool, thread_id)
+    usage_handler = UsageCallbackHandler(thread_id, str(user["id"]), session_in, session_out)
+    config = {
+        "configurable": {
+            "thread_id": thread_id,
+            "user_id": str(user["id"]),
+            "cancel_event": cancel_event,
+        },
+        "callbacks": [usage_handler],
+    }
 
     # 已有会话 → 读取快照判断状态（挂起中 / 已完成 / 不存在）
     snapshot = graph.get_state(config) if req.thread_id else None
@@ -127,6 +146,8 @@ async def chat_stream(req: ChatRequest, request: Request, user=CurrentUser):
         try:
             # 先把会话 ID 发给前端：新会话时前端据此才拿到 thread_id，才能调用 /chat/cancel
             yield _sse("session", {"thread_id": thread_id})
+            # 用量基线：请求开始先推一次，前端立即显示会话累计（随后每轮增长）
+            yield _sse("usage", usage_handler.snapshot())
             # 注意：用同步 graph.stream，而不是 astream——
             # PostgresSaver 只实现了同步 checkpoint 方法，astream 会调它没实现的
             # aget_tuple 抛 NotImplementedError（即之前看到的"服务内部错误"）。
@@ -137,9 +158,12 @@ async def chat_stream(req: ChatRequest, request: Request, user=CurrentUser):
                 stream_mode=["values", "custom", "messages"],
             ):
                 if mode == "custom":
-                    # call_llm / call_tool / HttpTool 转发的阶段进度
+                    # call_llm / call_tool / HttpTool 转发的阶段进度 / 用量快照
                     if isinstance(chunk, dict):
-                        yield _sse("stage", chunk)
+                        if "usage" in chunk:
+                            yield _sse("usage", chunk["usage"])
+                        else:
+                            yield _sse("stage", chunk)
                 elif mode == "messages":
                     # LLM token 增量：列表模式下标出的是 (message, metadata) 元组。
                     # 只转发 call_llm 轮的模型输出（call_tool 的 ToolMessage 会混进来，必须过滤掉）。
@@ -162,6 +186,7 @@ async def chat_stream(req: ChatRequest, request: Request, user=CurrentUser):
                             "approval_payload": intr.value,
                         })
                         return
+            yield _sse("usage", usage_handler.snapshot())  # done 前补最终用量
             yield _sse("done", {"thread_id": thread_id})
         except GenerationCancelled:
             # 用户主动停止 → 推 cancel 事件，前端显示"已停止生成"
@@ -176,6 +201,11 @@ async def chat_stream(req: ChatRequest, request: Request, user=CurrentUser):
         finally:
             # 清理取消标记，防止内存泄漏 / 下次误置位
             request.app.state.cancels.pop(thread_id, None)
+            # 用量落库：cancel / error 也落已完成轮次，不丢账
+            db.record_usage(request.app.state.pool, thread_id, str(user["id"]),
+                            usage_handler.usage.input_tokens,
+                            usage_handler.usage.output_tokens,
+                            usage_handler.usage.calls)
 
     return StreamingResponse(gen(), media_type="text/event-stream", headers={
         "Cache-Control": "no-cache",

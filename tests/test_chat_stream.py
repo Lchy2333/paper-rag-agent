@@ -136,3 +136,19 @@ def test_chat_stream_error_event(client):
     assert r.status_code == 200
     assert "event: error" in r.text
     assert '"error_code": "internal_error"' in r.text
+
+
+def test_chat_stream_usage_events(client):
+    """用量快照：请求开始推基线，custom 里的 usage 转成 event: usage（协议锁定）。"""
+    app.state.graph = _FakeGraph([
+        ("custom", {"usage": {"query_total": 20, "session_total": 120}}),
+        ("values", {"messages": []}),
+    ])
+
+    r = client.post("/api/chat/stream", json={"query": "hi"})
+    assert r.status_code == 200
+    text = r.text
+    # 请求开始基线 + custom 轮次快照 + done 前最终值，至少出现三次 usage 事件
+    assert text.count("event: usage") >= 3
+    assert '"query_total": 20' in text
+    assert '"session_total": 120' in text
