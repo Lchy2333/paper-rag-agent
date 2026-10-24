@@ -5,7 +5,9 @@
 """
 import json
 
+from langchain_core.language_models.chat_models import BaseChatModel, ChatGenerationChunk
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, SystemMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
 from langgraph.graph import END
 
 from agent.graph import build_graph
@@ -13,6 +15,7 @@ from agent.nodes import call_llm, call_tool, route_after_llm
 from agent.state import AgentState
 from core import Dispatcher, ToolRegistry
 from core.tool import ToolBase, ToolResult
+from core.usage import UsageCallbackHandler
 
 
 class _EchoTool(ToolBase):
@@ -125,3 +128,62 @@ def test_engine_full_loop():
     # 第二次调用 LLM 时，tools 已带上且 messages 是历史
     tools_arg = llm.calls[1]["tools"]
     assert tools_arg[0]["function"]["name"] == "echo"
+
+
+class _UsageLLM(BaseChatModel):
+    """真实走 LangChain 回调管线的假模型：流式 chunk 带 usage_metadata。
+
+    FakeLLM 不触发 on_llm_end（不是 Runnable），测 callback 采集必须用这个。
+    """
+
+    def __init__(self, replies):
+        super().__init__()
+        self._replies = list(replies)
+
+    @property
+    def _llm_type(self) -> str:
+        return "fake-usage"
+
+    def bind_tools(self, tools, *, tool_choice=None, **kwargs):
+        """BaseChatModel.bind_tools 默认 NotImplementedError，重写为返回自身。"""
+        return self
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        return ChatResult(generations=[ChatGeneration(message=self._replies.pop(0))])
+
+    def _stream(self, messages, stop=None, run_manager=None, **kwargs):
+        yield ChatGenerationChunk(message=self._replies.pop(0))
+
+
+def test_usage_callback_accumulates_multi_round():
+    """方案 B：UsageCallbackHandler 累计一轮 query 里多次 LLM 调用（工具循环两轮）。"""
+    dispatcher = _build_dispatcher()
+    llm = _UsageLLM([
+        AIMessageChunk(
+            content="",
+            tool_calls=[{"id": "call_1", "name": "echo", "args": {"msg": "hi"}}],
+            usage_metadata={"input_tokens": 15, "output_tokens": 5, "total_tokens": 20},
+        ),
+        AIMessageChunk(
+            content="回答：hi",
+            usage_metadata={"input_tokens": 28, "output_tokens": 20, "total_tokens": 48},
+        ),
+    ])
+
+    graph = build_graph(llm, dispatcher)
+    handler = UsageCallbackHandler("t1", "u1", session_input=100, session_output=30)
+    graph.invoke(
+        {"messages": [HumanMessage(content="hi")]},
+        config={"callbacks": [handler]},
+    )
+
+    # 两轮 LLM 调用全部累计：input 15+28，output 5+20
+    assert handler.usage.input_tokens == 43
+    assert handler.usage.output_tokens == 25
+    assert handler.usage.calls == 2
+    snap = handler.snapshot()
+    assert snap["query_total"] == 68
+    # 会话累计 = 基线 + 本次
+    assert snap["session_input"] == 143
+    assert snap["session_output"] == 55
+    assert snap["session_total"] == 198
