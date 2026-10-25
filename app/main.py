@@ -8,6 +8,7 @@
 import json
 import logging
 import sys
+import time
 from contextlib import asynccontextmanager
 
 import psycopg
@@ -35,6 +36,28 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
 )
 logger = logging.getLogger("paper-rag-agent")
+
+# 访问日志：与 RAG（Gin）侧统一格式，走独立 logger 输出原始行（不被 basicConfig 前缀污染）：
+# [ACCESS] 2026/10/25 - 06:17:40 | 200 | 17.851µs | 127.0.0.1 | GET "/health"
+access_logger = logging.getLogger("access")
+_access_handler = logging.StreamHandler(sys.stdout)
+_access_handler.setFormatter(logging.Formatter("%(message)s"))
+access_logger.addHandler(_access_handler)
+access_logger.setLevel(logging.INFO)
+access_logger.propagate = False
+
+
+def _format_duration(seconds: float) -> str:
+    """把秒格式化为 Go time.Duration 风格（17.851µs / 1.234ms / 2.345s）。"""
+
+    def _trim(s: str) -> str:
+        return s.rstrip("0").rstrip(".") if "." in s else s
+
+    if seconds * 1_000_000 < 1000:
+        return f"{_trim(f'{seconds * 1e6:.3f}')}µs"
+    if seconds * 1_000 < 1000:
+        return f"{_trim(f'{seconds * 1e3:.3f}')}ms"
+    return f"{_trim(f'{seconds:.3f}')}s"
 
 
 def build_agent():
@@ -105,6 +128,23 @@ app.include_router(threads.router, prefix="/api", tags=["threads"])
 app.include_router(documents.router, tags=["documents"])
 app.include_router(health.router)
 app.include_router(llm_check.router)
+
+
+@app.middleware("http")
+async def access_log_middleware(request: Request, call_next):
+    """统一访问日志（对齐 RAG/Gin 侧 [ACCESS] 格式），替代 uvicorn 默认 access log。"""
+    start = time.perf_counter()
+    response = await call_next(request)
+    access_logger.info(
+        '[ACCESS] %s | %d | %s | %s | %s "%s"',
+        time.strftime("%Y/%m/%d - %H:%M:%S", time.localtime()),
+        response.status_code,
+        _format_duration(time.perf_counter() - start),
+        request.client.host if request.client else "-",
+        request.method,
+        request.url.path,
+    )
+    return response
 
 
 @app.exception_handler(Exception)

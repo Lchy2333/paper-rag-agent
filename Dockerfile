@@ -21,4 +21,5 @@ COPY . .
 EXPOSE 8001
 # 单 worker：多 worker 并发 PostgresSaver.setup() 会撞表冲突；
 # agent 是 I/O 等待型（等 LLM），单 worker + FastAPI 异步已够用
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8001", "--workers", "1"]
+# --no-access-log：访问日志改由 app.main 的中间件统一输出（对齐 RAG/Gin [ACCESS] 格式）
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8001", "--workers", "1", "--no-access-log"]
