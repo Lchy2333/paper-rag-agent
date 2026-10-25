@@ -77,6 +77,8 @@ def build_agent():
         base_url=settings.llm_base_url,
         api_key=settings.llm_api_key,
         model=settings.llm_model,
+        timeout=settings.llm_timeout,      # 传输层超时：read 空闲上限，防"挂起"无限等待
+        max_retries=settings.llm_max_retries,  # 0：重试收敛到业务层 call_llm，避免叠乘放大
     )
     # checkpointer 是 HITL 中断恢复 + 多轮会话的存档仓库；
     # 生产用 Postgres 持久化（独立库 paper_rag_agent），多副本共享会话状态，

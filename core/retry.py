@@ -24,8 +24,12 @@ def retry_call(fn: Callable, *, retryable: Callable[[Exception], bool],
 
 
 def is_transient(e: Exception) -> bool:
-    """判定异常是否为「暂时失败」：超时/连接/限流/5xx → 可重试。"""
-    if isinstance(e, requests.Timeout) or isinstance(e, requests.ConnectionError):
+    """判定异常是否为「暂时失败」：超时/连接/限流/5xx → 可重试。
+
+    TimeoutError（内置）也在列：call_llm 的首 token 守护（core/llm_probe 同款思路）
+    在"上游挂起、限期内无数据"时抛内置 TimeoutError——它语义上是超时，应当可重试。
+    """
+    if isinstance(e, (requests.Timeout, TimeoutError, requests.ConnectionError)):
         return True
     if isinstance(e, openai.RateLimitError):
         return True

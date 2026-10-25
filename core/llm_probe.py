@@ -17,6 +17,8 @@ from typing import Optional
 from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
 
+from core.stream_guard import iter_stream_with_guard
+
 logger = logging.getLogger(__name__)
 
 # 主动探针节流间隔（秒）：即使 /health 被 5s 轮询，也最多每 60s 真调一次 LLM
@@ -29,8 +31,8 @@ FAILURE_THRESHOLD = 2
 STALE_SECONDS = 600
 
 
-def check_llm(base_url: str, api_key: str, model: str, timeout: int = PROBE_TIMEOUT_SECONDS) -> dict:
-    """就绪验证：用给定配置发一次 max_tokens=1 调用，返回 {ok, latency_ms, error?}。
+def check_invoke(base_url: str, api_key: str, model: str, timeout: int = PROBE_TIMEOUT_SECONDS) -> dict:
+    """就绪验证（invoke 通道）：用给定配置发一次 max_tokens=1 调用，返回 {ok, latency_ms, error?}。
 
     可复用场景：/health 主动探针、/api/llm/check（BYOK 用户验证自有配置）。
     不抛异常，任何失败都归一化为 ok=False + error。
@@ -56,6 +58,52 @@ def check_llm(base_url: str, api_key: str, model: str, timeout: int = PROBE_TIME
         latency_ms = round((time.time() - start) * 1000)
         logger.warning("llm_probe_failed latency_ms=%s error=%s", latency_ms, str(e)[:200])
         return {"ok": False, "latency_ms": latency_ms, "error": str(e)[:200]}
+
+
+def check_llm_stream(base_url: str, api_key: str, model: str,
+                     timeout: int = PROBE_TIMEOUT_SECONDS,
+                     first_token_timeout: int = PROBE_TIMEOUT_SECONDS) -> dict:
+    """就绪验证（stream 通道）：stream=True 发 max_tokens=1，要求首 token 限期内到达。
+
+    补 check_invoke 的盲区：invoke 通不代表 stream 通道正常——部分端点/代理对
+    stream 请求会挂起/缓冲（线上真实故障即此类，见 architecture.md §15）。
+    复用 iter_stream_with_guard 做首 token 守护：挂起 → 抛 TimeoutError → 归一化为失败。
+    """
+    if not (base_url and api_key and model):
+        return {"ok": False, "error": "LLM 配置不完整（base_url / api_key / model 均需提供）"}
+
+    llm = ChatOpenAI(
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        max_tokens=1,
+        timeout=timeout,
+        max_retries=0,  # 探针不做重试，一次定生死，避免放大
+    )
+    start = time.time()
+    try:
+        next(iter_stream_with_guard(
+            llm.stream([HumanMessage(content="ping")]), first_token_timeout))
+        latency_ms = round((time.time() - start) * 1000)
+        logger.info("llm_probe_stream_ok latency_ms=%s", latency_ms)
+        return {"ok": True, "latency_ms": latency_ms}
+    except Exception as e:  # noqa: BLE001 —— 探针必须吞掉一切异常
+        latency_ms = round((time.time() - start) * 1000)
+        logger.warning("llm_probe_stream_failed latency_ms=%s error=%s", latency_ms, str(e)[:200])
+        return {"ok": False, "latency_ms": latency_ms, "error": str(e)[:200]}
+
+
+def check_llm_full(base_url: str, api_key: str, model: str,
+                   timeout: int = PROBE_TIMEOUT_SECONDS) -> dict:
+    """就绪验证（双通道）：invoke + stream 都通才算 ok。
+
+    invoke 失败直接返回（不必再试 stream）；invoke 通过但 stream 挂 → 返回 stream 的错误，
+    把"invoke 通 / stream 挂"的通道差异暴露出来。/health 主动探针与 /api/llm/check 用它。
+    """
+    invoke = check_invoke(base_url, api_key, model, timeout)
+    if not invoke["ok"]:
+        return invoke
+    return check_llm_stream(base_url, api_key, model, timeout)
 
 
 class LLMHealthTracker:
@@ -114,10 +162,10 @@ class LLMHealthTracker:
         if last_success is not None:
             return {"status": "unknown"}
 
-        # 4) 从未成功过（冷启动）→ 用节流主动探针兜底
+        # 4) 从未成功过（冷启动）→ 用节流主动探针兜底（invoke + stream 双通道）
         if last_probe_at is None or (now - last_probe_at) >= PROBE_THROTTLE_SECONDS:
             base_url, api_key, model = global_llm
-            result = check_llm(base_url, api_key, model)
+            result = check_llm_full(base_url, api_key, model)
             with self._lock:
                 self._last_probe_at = now
                 self._last_probe_result = result

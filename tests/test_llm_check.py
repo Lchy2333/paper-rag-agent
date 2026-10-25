@@ -30,9 +30,9 @@ def client(monkeypatch):
 
 
 def test_llm_check_ok(client, monkeypatch):
-    # check_llm 在 llm_check 模块内被 import 绑定，patch 模块内引用
+    # check_llm_full 在 llm_check 模块内被 import 绑定，patch 模块内引用
     monkeypatch.setattr(
-        "app.api.llm_check.check_llm",
+        "app.api.llm_check.check_llm_full",
         lambda base_url, api_key, model: {"ok": True, "latency_ms": 12},
     )
     r = client.post("/api/llm/check", json={
@@ -46,7 +46,7 @@ def test_llm_check_ok(client, monkeypatch):
 
 def test_llm_check_failure_400(client, monkeypatch):
     monkeypatch.setattr(
-        "app.api.llm_check.check_llm",
+        "app.api.llm_check.check_llm_full",
         lambda base_url, api_key, model: {"ok": False, "error": "auth failed"},
     )
     r = client.post("/api/llm/check", json={
@@ -60,7 +60,7 @@ def test_llm_check_failure_400(client, monkeypatch):
 
 def test_llm_check_requires_auth(client, monkeypatch):
     monkeypatch.setattr(
-        "app.api.llm_check.check_llm",
+        "app.api.llm_check.check_llm_full",
         lambda base_url, api_key, model: {"ok": True},
     )
     app.dependency_overrides.pop(get_current_user, None)  # 移除假认证

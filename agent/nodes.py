@@ -18,15 +18,14 @@ from langgraph.types import interrupt
 
 from core.dispatcher import Dispatcher
 from core.retry import is_transient
+from core.stream_guard import GenerationCancelled, iter_stream_with_guard
 
 logger = logging.getLogger(__name__)
 
-
-class GenerationCancelled(Exception):
-    """用户在前端主动中断生成：节点抛出，/chat/stream 捕获后以 cancel 事件收尾。
-
-    必须单独捕获（不能走 classify_exception 兜底），否则会被当成 internal_error。
-    """
+# 首 token 守护（秒）：流开始后限期内无首 chunk → 判死。
+# 上游挂起（对 stream 请求不吐数据）若不判死，会无限阻塞线程池线程；
+# 判死抛 TimeoutError（is_transient 已覆盖）→ 由下方重试循环按瞬态错误重试。
+FIRST_TOKEN_TIMEOUT = 30.0
 
 
 def call_llm(llm, dispatcher: Dispatcher, tracker=None) -> Callable:
@@ -59,9 +58,13 @@ def call_llm(llm, dispatcher: Dispatcher, tracker=None) -> Callable:
         attempt = 0
         while True:
             try:
-                for chunk in llm_with_tools.stream(state["messages"]):
-                    if cancel_event is not None and cancel_event.is_set():
-                        raise GenerationCancelled()
+                # 用首 token 守护包住 stream：上游挂起（限期内无数据）→ TimeoutError
+                # （瞬态，进入下方重试）；逐 chunk 检查 cancel_event（挂起时也有效）
+                for chunk in iter_stream_with_guard(
+                    llm_with_tools.stream(state["messages"]),
+                    FIRST_TOKEN_TIMEOUT,
+                    cancel_event=cancel_event,
+                ):
                     final = chunk if final is None else final + chunk
                 break  # 流正常走完
             except GenerationCancelled:
