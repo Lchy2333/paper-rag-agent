@@ -29,7 +29,8 @@ def approve(req: ApproveRequest, request: Request, user=CurrentUser):
     if thread["user_id"] != user["id"]:
         raise HTTPException(status_code=403, detail="无权操作该会话")
 
-    config = {"configurable": {"thread_id": req.thread_id}}
+    # user_id 来自 JWT 验签（user["id"]），不可取自请求体（前端可伪造，见避坑 #18）
+    config = {"configurable": {"thread_id": req.thread_id, "user_id": str(user["id"])}}
     request.state.thread_id = req.thread_id  # 捎带给 exception_handler 做日志关联
     request.state.user_id = str(user["id"])
     resume_value = "allow" if req.approved else "reject"
