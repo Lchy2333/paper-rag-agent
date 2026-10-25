@@ -2,7 +2,8 @@
 
 用途（BYOK 复用点，见 architecture.md §13 / §11）：
 - 用户在"配置自己的 LLM"时，用本接口验证 base_url / api_key / model 是否可用；
-- 实现复用 core.llm_probe.check_llm（与 /health 主动探针同源，一份逻辑）。
+- 实现复用 core.llm_probe.check_llm_full（invoke + stream 双通道，与 /health 主动探针同源，
+  一份逻辑）。stream 通道单独验证是因为 invoke 通不代表 stream 通（线上真实故障，见 §15）；
 - 注意：body 里的 api_key 是用户自己的，仅本请求内存态使用，不落库。
 """
 import logging
@@ -11,7 +12,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from app.auth import CurrentUser
-from core.llm_probe import check_llm
+from core.llm_probe import check_llm_full
 
 logger = logging.getLogger(__name__)
 
@@ -26,8 +27,8 @@ class LLMCheckRequest(BaseModel):
 
 @router.post("/check")
 def llm_check(req: LLMCheckRequest, user=CurrentUser):
-    """验证一组 LLM 配置是否可用（发一次 max_tokens=1 探针调用）。需要登录。"""
-    result = check_llm(req.base_url, req.api_key, req.model)
+    """验证一组 LLM 配置是否可用（invoke + stream 双通道探针调用）。需要登录。"""
+    result = check_llm_full(req.base_url, req.api_key, req.model)
     if not result.get("ok"):
         logger.info("llm_check_failed model=%s error=%s", req.model, result.get("error"))
         raise HTTPException(status_code=400, detail=result.get("error", "LLM 配置不可用"))

@@ -36,6 +36,11 @@ class Settings(BaseSettings):
     llm_base_url: str = ""
     llm_api_key: str = ""
     llm_model: str = ""
+    # LLM 调用超时约束（2026-10 修复"上游挂起导致无响应"，见 architecture.md §15）：
+    llm_timeout: float = 120.0  # 阶段超时（秒）：read 空闲上限——首 token / 相邻 chunk 的等待上限，
+    #                            防"请求发出但数据流停滞"无限阻塞线程池
+    llm_max_retries: int = 0    # 客户端自动重试：0 = 收敛到业务层 call_llm 统一重试
+    #                            （只重试"首 token 前瞬态失败"），避免客户端层叠乘放大
 
     # RAG 服务
     rag_base_url: str = "http://localhost:8080"
