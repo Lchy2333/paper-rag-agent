@@ -69,6 +69,7 @@ event: error    → 执行失败
 - **用同步 `graph.stream` 而非 `astream`**：`PostgresSaver` 只实现了同步 checkpoint 方法，`astream` 会抛 `NotImplementedError`（已在 `/chat/stream` 注释说明）。
 - **随时停止**：`call_llm` 改用 `llm.stream()` 逐字生成，每个 token 前检查取消开关（`threading.Event`）；`/chat/cancel` 置位开关 → 节点抛 `GenerationCancelled` → 流以 `event: cancel` 收尾。停止粒度 = 一个 token。
 - **Token 用量统计（2026-10）**：`core/usage.py` 的 `UsageCallbackHandler` 挂 `config["callbacks"]`（节点零改动），`on_llm_end` 读 `usage_metadata` 累加（含子图内调用）；`event: usage` 载荷含 `query_total`（本次 query 增量）与 `session_total`（会话累计，基线 = SUM `query_usage` 表）。请求结束落库（`finally`，cancel/error 也落），前端消息下方 + 底部栏展示。
+- **踩坑：worker 线程丢回调（2026-10 已修）**：`iter_stream_with_guard` 把 LLM 流搬到工作线程消费，而 LangChain 回调上下文存于 contextvar（线程局部）→ `on_llm_end` 静默失效、用量恒为 0。已用 `contextvars.copy_context()` + `ctx.run()` 恢复主线程上下文（详见 architecture.md §14.6 / §15.5）。
 - 原 `/api/chat`（一次性 JSON）保留做兼容/兜底。
 
 ## 架构总览

@@ -12,7 +12,14 @@ daemon 工作线程 + 队列，主循环在 q.get(timeout=...) 上等待：
 - 取消：每收到一个 chunk 检查 cancel_event，置位即抛 GenerationCancelled；
 - 流内异常：worker 透传到主循环原样重抛。
 工作线程 daemon=True，即使被挂起的流卡住也不阻塞进程退出。
+
+注意（contextvar 线程局部坑）：LangChain 的 callback manager 与 LangGraph 的
+stream writer 都存于 contextvar，而 contextvar 是线程局部的——若 worker 线程直接
+消费流，LLM 调用会因看不到主线程的 callback 上下文而不触发任何 on_* 回调（用量
+统计/健康追踪全部失效）。因此 worker 必须用 contextvars.copy_context() 恢复主线程
+上下文后再消费流。
 """
+import contextvars
 import queue
 import threading
 import time
@@ -25,13 +32,21 @@ class GenerationCancelled(Exception):
     """
 
 
+def _consume(stream, q: queue.Queue):
+    """在工作线程（已恢复主线程 contextvar）里消费流，chunk 进队列、异常透传。"""
+    for chunk in stream:
+        q.put(("chunk", chunk))
+
+
 def iter_stream_with_guard(stream, first_token_timeout: float, cancel_event=None):
     q: queue.Queue = queue.Queue(maxsize=16)
+    # 捕获主线程全部 contextvar（callback manager / stream writer 等），
+    # 工作线程里用 ctx.run 恢复——否则 LLM 调用不触发 on_llm_start/on_llm_end
+    ctx = contextvars.copy_context()
 
     def worker():
         try:
-            for chunk in stream:
-                q.put(("chunk", chunk))
+            ctx.run(_consume, stream, q)
         except BaseException as e:  # 流内抛错（含超时/5xx）透传给主循环
             q.put(("error", e))
         finally:
