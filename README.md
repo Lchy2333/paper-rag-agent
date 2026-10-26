@@ -34,10 +34,11 @@ core/                 # 核心抽象层（与业务无关）
   rag_proxy.py          # BFF 转发器：注入可信 X-User-ID + X-API-Key，上传大超时
   llm_probe.py          # LLM 就绪探针（max_tokens=1）+ 被动信号 tracker
   usage.py              # token 用量统计（UsageCallbackHandler，callback 采集，节点零改动）
+  model_limits.py       # 模型上下文窗口/输入预算（models.dev 目录 + TTL 缓存 + .env 覆盖）
 tools/                # 具体工具
   RAGtools.json         # RAG 接口声明（一个接口 = 一段配置）
   http_tool.py          # 通用 HTTP 工具（自动注入 X-User-ID 头）
-migrations/           # 数据库迁移脚本（001 建表 / 002 置顶列 / 003 用量表）
+migrations/           # 数据库迁移脚本（001 建表 / 002 置顶列 / 003 用量表 / 004 上下文水位列）
 tests/                # 测试
 ```
 
@@ -69,6 +70,18 @@ event: error    → 执行失败
 - **用同步 `graph.stream` 而非 `astream`**：`PostgresSaver` 只实现了同步 checkpoint 方法，`astream` 会抛 `NotImplementedError`（已在 `/chat/stream` 注释说明）。
 - **随时停止**：`call_llm` 改用 `llm.stream()` 逐字生成，每个 token 前检查取消开关（`threading.Event`）；`/chat/cancel` 置位开关 → 节点抛 `GenerationCancelled` → 流以 `event: cancel` 收尾。停止粒度 = 一个 token。
 - **Token 用量统计（2026-10）**：`core/usage.py` 的 `UsageCallbackHandler` 挂 `config["callbacks"]`（节点零改动），`on_llm_end` 读 `usage_metadata` 累加（含子图内调用）；`event: usage` 载荷含 `query_total`（本次 query 增量）与 `session_total`（会话累计，基线 = SUM `query_usage` 表）。请求结束落库（`finally`，cancel/error 也落），前端消息下方 + 底部栏展示。
+- **上下文占用（2026-10）**：`core/model_limits.py` 在 lifespan 解析一次模型限额，算成 **输入预算** `input_budget`（`min(输入上限, 窗口 − 输出预留) − 安全余量`），注入 `UsageCallbackHandler`。`event: usage` 追加四个字段：
+
+  | 字段 | 含义 |
+  |---|---|
+  | `context_window` | 模型上下文窗口（tokens），写死/目录值 |
+  | `context_budget` | 输入预算（分母），前端占用率的分母 |
+  | `context_used` | **最近一轮** LLM 调用的 `input_tokens`（水位，覆盖不累加） |
+  | `context_ratio` | `context_used / context_budget`，预算未知或未调用过模型时为 `null` |
+
+  分母用输入预算而非窗口：input 是主动重发的、超限直接 400；output 有 `max_output` 硬上限且不计入下次 input（不会二次入场），故只用 `last_input` 当水位。前端底部提示栏渲染"环形进度 + 百分比"（<60% 常规 / 60–85% 提醒 / >85% 警示）。
+- **上下文水位持久化（2026-10）**：`query_usage` 增列 `last_input_tokens`（迁移 004），每次 query 结束与用量一起落库；`GET /api/threads/{thread_id}/usage` 返回会话累计（SUM）与最近一次的水位，前端切换会话/刷新页面时据此恢复环形指示器，不必等下一次 LLM 调用。历史行默认 0 → `context_ratio = null` → 前端隐藏，不展示假数据。
+  `LLM_CONTEXT_WINDOW > 0` 时直接用该值、**完全不访问网络**；为 `0` 才回退 `https://models.dev/api.json`，按 `LLM_PROVIDER_ID + LLM_MODEL` 查 `limit.context/input/output`（TTL 24h，拉取失败沿用旧缓存）。
 - **踩坑：worker 线程丢回调（2026-10 已修）**：`iter_stream_with_guard` 把 LLM 流搬到工作线程消费，而 LangChain 回调上下文存于 contextvar（线程局部）→ `on_llm_end` 静默失效、用量恒为 0。已用 `contextvars.copy_context()` + `ctx.run()` 恢复主线程上下文（详见 architecture.md §14.6 / §15.5）。
 - 原 `/api/chat`（一次性 JSON）保留做兼容/兜底。
 
@@ -102,6 +115,7 @@ event: error    → 执行失败
   - `migrations/001_init.sql`：users / threads / audit_logs
   - `migrations/002_threads_pinned.sql`：threads 加 pinned 列
   - `migrations/003_query_usage.sql`：query_usage 表（token 用量明细，会话累计的事实源）
+  - `migrations/004_query_usage_last_input.sql`：query_usage 加 `last_input_tokens`（上下文水位）
 - `checkpoints` 系列表由 `PostgresSaver.setup()` 启动时自动创建
 
 ### 2. 配置 .env
@@ -120,6 +134,10 @@ APP_ENV=dev
 LLM_BASE_URL=https://ark.cn-beijing.volces.com/api/plan/v3/
 LLM_API_KEY=your-llm-api-key
 LLM_MODEL=deepseek-v4-flash
+# 上下文窗口（tokens）：>0 直接用（火山 deepseek-v4-flash 标称 1049K，写死 1048576）；0 = 回退查 models.dev
+LLM_CONTEXT_WINDOW=1048576
+# models.dev 目录中的 provider 条目（火山 Agent Plan 为 volcengine-coding-plan）
+LLM_PROVIDER_ID=volcengine-coding-plan
 RAG_BASE_URL=http://localhost:8080
 RAG_API_KEY=your-rag-api-key
 DATABASE_URL=postgresql://postgres:密码@localhost:5432/paper_rag_agent
@@ -158,6 +176,7 @@ pytest tests\ -v
 | `/api/chat/cancel` | POST | Bearer | **中断**指定会话正在进行的生成（幂等，归属校验） |
 | `/api/approve` | POST | Bearer | HITL 审批（越权 403 / 不存在 404） |
 | `GET /api/threads` | GET | Bearer | 列自己的会话（置顶优先） |
+| `GET /api/threads/{id}/usage` | GET | Bearer | 会话累计用量 + 上下文占用（切换会话时恢复展示） |
 | `PATCH /api/threads/{id}` | PATCH | Bearer | 改名 / 置顶 |
 | `DELETE /api/threads/{id}` | DELETE | Bearer | 删除会话（连带对话快照） |
 | `GET /api/documents` | GET | Bearer | 文档列表（BFF 转发 RAG） |

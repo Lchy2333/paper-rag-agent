@@ -41,6 +41,12 @@ class Settings(BaseSettings):
     #                            防"请求发出但数据流停滞"无限阻塞线程池
     llm_max_retries: int = 0    # 客户端自动重试：0 = 收敛到业务层 call_llm 统一重试
     #                            （只重试"首 token 前瞬态失败"），避免客户端层叠乘放大
+    # 上下文窗口（tokens）：前端"上下文占用率"指示器的分母来源（见 core/model_limits.py）
+    # - >0：直接用该值（火山 deepseek-v4-flash 控制台标称 1049K，先写死 1048576）
+    # - 0 ：回退到 models.dev 目录，按 LLM_PROVIDER_ID + LLM_MODEL 查询
+    llm_context_window: int = 1048576
+    # models.dev 目录里的 provider 条目名（火山 Agent Plan 为 volcengine-coding-plan）
+    llm_provider_id: str = "volcengine-coding-plan"
 
     # RAG 服务
     rag_base_url: str = "http://localhost:8080"

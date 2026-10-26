@@ -52,7 +52,15 @@ def chat(req: ChatRequest, request: Request, user=CurrentUser) -> ChatResponse:
 
     # 用量统计：读 session 基线 → 挂 callback（节点零改动，图内所有 LLM 调用自动累计）
     session_in, session_out = db.get_session_usage(request.app.state.pool, thread_id)
-    usage_handler = UsageCallbackHandler(thread_id, str(user["id"]), session_in, session_out)
+    limits = getattr(request.app.state, "llm_limits", None)
+    usage_handler = UsageCallbackHandler(
+        thread_id,
+        str(user["id"]),
+        session_in,
+        session_out,
+        input_budget=limits.input_budget if limits else None,
+        context_window=limits.context_window if limits else None,
+    )
     config = {
         "configurable": {"thread_id": thread_id, "user_id": str(user["id"])},
         "callbacks": [usage_handler],
@@ -80,7 +88,8 @@ def chat(req: ChatRequest, request: Request, user=CurrentUser) -> ChatResponse:
     db.record_usage(request.app.state.pool, thread_id, str(user["id"]),
                     usage_handler.usage.input_tokens,
                     usage_handler.usage.output_tokens,
-                    usage_handler.usage.calls)
+                    usage_handler.usage.calls,
+                    usage_handler.last_input_tokens)
 
     if "__interrupt__" in result:
         intr = result["__interrupt__"][0]
@@ -119,7 +128,15 @@ async def chat_stream(req: ChatRequest, request: Request, user=CurrentUser):
 
     # 用量统计：读 session 基线 → 挂 callback；gen() 里每轮推送 + finally 落库
     session_in, session_out = db.get_session_usage(request.app.state.pool, thread_id)
-    usage_handler = UsageCallbackHandler(thread_id, str(user["id"]), session_in, session_out)
+    limits = getattr(request.app.state, "llm_limits", None)
+    usage_handler = UsageCallbackHandler(
+        thread_id,
+        str(user["id"]),
+        session_in,
+        session_out,
+        input_budget=limits.input_budget if limits else None,
+        context_window=limits.context_window if limits else None,
+    )
     config = {
         "configurable": {
             "thread_id": thread_id,
@@ -205,7 +222,8 @@ async def chat_stream(req: ChatRequest, request: Request, user=CurrentUser):
             db.record_usage(request.app.state.pool, thread_id, str(user["id"]),
                             usage_handler.usage.input_tokens,
                             usage_handler.usage.output_tokens,
-                            usage_handler.usage.calls)
+                            usage_handler.usage.calls,
+                            usage_handler.last_input_tokens)
 
     return StreamingResponse(gen(), media_type="text/event-stream", headers={
         "Cache-Control": "no-cache",

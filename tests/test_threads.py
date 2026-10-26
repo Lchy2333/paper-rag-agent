@@ -290,3 +290,41 @@ def test_delete_thread_other_user_403(ctx, monkeypatch):
         _clear_user()
     assert r.status_code == 403
     assert g.deleted == []
+
+
+# ---------- GET /api/threads/{id}/usage（恢复上下文指示器） ----------
+
+def test_thread_usage_returns_meter(ctx, monkeypatch):
+    """会话累计 + 上下文水位：ratio 与 SSE usage 事件同口径（used / budget）。"""
+    from core.model_limits import ModelLimits
+
+    c, _ = ctx
+    _as_user(USER_A)
+    monkeypatch.setattr("app.db.get_thread", lambda pool, tid: _thread_row(owner=USER_A))
+    monkeypatch.setattr(
+        "app.db.get_thread_usage",
+        lambda pool, tid: {"input_tokens": 4241, "output_tokens": 444, "last_input_tokens": 2979},
+    )
+    app.state.llm_limits = ModelLimits(context_window=1_048_576, input_budget=1_036_288)
+    try:
+        r = c.get(f"/api/threads/{THREAD}/usage")
+    finally:
+        _clear_user()
+    assert r.status_code == 200
+    body = r.json()
+    assert body["session_total"] == 4685
+    assert body["context_used"] == 2979
+    assert body["context_budget"] == 1_036_288
+    assert body["context_window"] == 1_048_576
+    assert body["context_ratio"] == round(2979 / 1_036_288, 4)
+
+
+def test_thread_usage_other_user_403(ctx, monkeypatch):
+    c, _ = ctx
+    _as_user(USER_A)
+    monkeypatch.setattr("app.db.get_thread", lambda pool, tid: _thread_row(owner=USER_B))
+    try:
+        r = c.get(f"/api/threads/{THREAD}/usage")
+    finally:
+        _clear_user()
+    assert r.status_code == 403

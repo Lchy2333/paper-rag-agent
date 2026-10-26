@@ -138,6 +138,31 @@ def get_session_usage(pool, thread_id: str) -> Tuple[int, int]:
     return row["input_tokens"], row["output_tokens"]
 
 
+def get_thread_usage(pool, thread_id: str) -> Dict[str, int]:
+    """会话累计用量 + 最近一次 query 的上下文水位（切换会话时恢复前端指示器）。
+
+    last_input_tokens 取最近一行（按 created_at / id 倒序），不做累加：
+    它代表"最后一次调用时上下文占用了多少"，是当前水位而非计费量。
+    """
+    with pool.connection() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(input_tokens), 0) AS input_tokens,"
+            " COALESCE(SUM(output_tokens), 0) AS output_tokens"
+            " FROM query_usage WHERE thread_id = %s",
+            (thread_id,),
+        ).fetchone()
+        last = conn.execute(
+            "SELECT last_input_tokens FROM query_usage WHERE thread_id = %s"
+            " ORDER BY created_at DESC, id DESC LIMIT 1",
+            (thread_id,),
+        ).fetchone()
+    return {
+        "input_tokens": row["input_tokens"] if row else 0,
+        "output_tokens": row["output_tokens"] if row else 0,
+        "last_input_tokens": last["last_input_tokens"] if last else 0,
+    }
+
+
 def record_usage(
     pool,
     thread_id: str,
@@ -145,11 +170,13 @@ def record_usage(
     input_tokens: int,
     output_tokens: int,
     calls: int,
+    last_input_tokens: int = 0,
 ) -> None:
     """每次 query 结束落一行（调用方在 finally 里调，cancel / error 也落）。"""
     with pool.connection() as conn:
         conn.execute(
-            "INSERT INTO query_usage (thread_id, user_id, input_tokens, output_tokens, calls)"
-            " VALUES (%s, %s, %s, %s, %s)",
-            (thread_id, user_id, input_tokens, output_tokens, calls),
+            "INSERT INTO query_usage"
+            " (thread_id, user_id, input_tokens, output_tokens, calls, last_input_tokens)"
+            " VALUES (%s, %s, %s, %s, %s, %s)",
+            (thread_id, user_id, input_tokens, output_tokens, calls, last_input_tokens),
         )
