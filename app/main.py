@@ -26,6 +26,7 @@ from app.config import settings
 from app.errors import classify_exception
 from core import Dispatcher, ToolRegistry
 from core.llm_probe import LLMHealthTracker
+from core.model_limits import resolve_llm_limits
 from core.rag_proxy import RagProxy
 from tools.http_tool import HttpTool
 
@@ -114,6 +115,14 @@ async def lifespan(app: FastAPI):
     app.state.llm_tracker = llm_tracker
     app.state.settings = settings
     app.state.system_prompt = settings.system_prompt
+    # 模型上下文限额：启动期解析一次（.env 写死 > models.dev 目录 > None），
+    # 供 /chat 与 /chat/stream 注入 usage handler 算上下文占用率。
+    app.state.llm_limits = resolve_llm_limits(settings)
+    logger.info(
+        "llm_limits context_window=%s input_budget=%s",
+        app.state.llm_limits.context_window,
+        app.state.llm_limits.input_budget,
+    )
     # 进程内"取消生成"注册表：thread_id → threading.Event（/chat/stream 创建，/chat/cancel 置位）
     app.state.cancels = {}
     try:

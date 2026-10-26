@@ -13,8 +13,10 @@ from app.auth import CurrentUser
 from app.schemas import (
     DeleteThreadResponse,
     ThreadOut,
+    ThreadUsageOut,
     UpdateThreadRequest,
 )
+from core.usage import context_ratio
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +47,34 @@ def list_threads(request: Request, user=CurrentUser) -> List[ThreadOut]:
         )
         for r in rows
     ]
+
+
+@router.get("/{thread_id}/usage", response_model=ThreadUsageOut)
+def get_thread_usage(
+    thread_id: str,
+    request: Request,
+    user=CurrentUser,
+) -> ThreadUsageOut:
+    """会话用量 + 上下文占用：切换会话/刷新页面时前端据此恢复展示。
+
+    context_used 取 query_usage 最近一行的 last_input_tokens（当前水位），
+    与 SSE usage 事件同一口径，因此恢复出来的环与实时值一致。
+    """
+    _get_owned_thread(request.app.state.pool, thread_id, user["id"])
+    row = db.get_thread_usage(request.app.state.pool, thread_id)
+    limits = getattr(request.app.state, "llm_limits", None)
+    budget = limits.input_budget if limits else None
+    used = row["last_input_tokens"]
+    return ThreadUsageOut(
+        thread_id=thread_id,
+        session_input=row["input_tokens"],
+        session_output=row["output_tokens"],
+        session_total=row["input_tokens"] + row["output_tokens"],
+        context_window=limits.context_window if limits else None,
+        context_budget=budget,
+        context_used=used,
+        context_ratio=context_ratio(used, budget),
+    )
 
 
 @router.patch("/{thread_id}", response_model=ThreadOut)

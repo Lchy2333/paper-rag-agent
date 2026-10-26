@@ -29,6 +29,13 @@ class Usage:
         return self.input_tokens + self.output_tokens
 
 
+def context_ratio(used: int, budget: Optional[int]) -> Optional[float]:
+    """上下文占用率 = 最后一轮 input / 输入预算；未知时返回 None（前端隐藏指示器）。"""
+    if budget and used > 0:
+        return round(used / budget, 4)
+    return None
+
+
 class UsageCallbackHandler(BaseCallbackHandler):
     """按"一次图运行"累计所有 LLM 调用的 token 用量。
 
@@ -43,12 +50,19 @@ class UsageCallbackHandler(BaseCallbackHandler):
         user_id: str,
         session_input: int = 0,
         session_output: int = 0,
+        input_budget: Optional[int] = None,
+        context_window: Optional[int] = None,
     ):
         self.thread_id = thread_id
         self.user_id = user_id
         self.usage = Usage()
         self.session_input = session_input   # 会话基线（请求开始时从 DB SUM 读出）
         self.session_output = session_output
+        # 上下文占用：分母是输入预算（窗口 − 输出预留 − 安全余量，见 core/model_limits.py），
+        # 分子只取"最后一轮 input"——每轮 input 都是完整重发，最后一轮即当前真实占用。
+        self.input_budget = input_budget
+        self.context_window = context_window
+        self.last_input_tokens = 0
         self._lock = threading.Lock()        # 防御性：FastAPI 线程池下并发安全
 
     def on_llm_end(self, response: Any, **kwargs) -> None:
@@ -59,6 +73,7 @@ class UsageCallbackHandler(BaseCallbackHandler):
             self.usage.input_tokens += u["input_tokens"]
             self.usage.output_tokens += u["output_tokens"]
             self.usage.calls += 1
+            self.last_input_tokens = u["input_tokens"]  # 覆盖而非累加：取最新一轮的水位
         # 每轮结束推一次 custom 事件；非流式（graph.invoke）时 writer 为 None 自动跳过
         try:
             writer = get_stream_writer()
@@ -68,7 +83,9 @@ class UsageCallbackHandler(BaseCallbackHandler):
             writer({"usage": self.snapshot()})
 
     def snapshot(self) -> dict:
-        """SSE 事件载荷：本次 query 增量 + 会话累计（含基线）。"""
+        """SSE 事件载荷：本次 query 增量 + 会话累计（含基线）+ 上下文占用。"""
+        # 还没发生 LLM 调用 → 占用未知（ratio=None，前端隐藏指示器，不展示假的 0%）
+        ratio = context_ratio(self.last_input_tokens, self.input_budget)
         return {
             "thread_id": self.thread_id,
             "calls": self.usage.calls,
@@ -78,6 +95,10 @@ class UsageCallbackHandler(BaseCallbackHandler):
             "session_input": self.session_input + self.usage.input_tokens,
             "session_output": self.session_output + self.usage.output_tokens,
             "session_total": self.session_input + self.session_output + self.usage.total_tokens,
+            "context_window": self.context_window,
+            "context_budget": self.input_budget,
+            "context_used": self.last_input_tokens,
+            "context_ratio": ratio,
         }
 
     @staticmethod

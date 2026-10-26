@@ -63,3 +63,16 @@ class UpdateThreadRequest(BaseModel):
 class DeleteThreadResponse(BaseModel):
     status: str = "deleted"
     thread_id: str
+
+
+class ThreadUsageOut(BaseModel):
+    """会话用量 + 上下文占用（切换会话/刷新页面时恢复前端展示）。"""
+
+    thread_id: str
+    session_input: int = Field(..., description="会话累计输入 tokens")
+    session_output: int = Field(..., description="会话累计输出 tokens")
+    session_total: int = Field(..., description="会话累计 = input + output")
+    context_window: Optional[int] = Field(None, description="模型上下文窗口；null = 未知")
+    context_budget: Optional[int] = Field(None, description="输入预算（占用率分母）；null = 未知")
+    context_used: int = Field(0, description="最近一次 query 的 last_input_tokens（当前水位）")
+    context_ratio: Optional[float] = Field(None, description="context_used / context_budget；null = 未知")
