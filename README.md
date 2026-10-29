@@ -20,7 +20,7 @@ app/                  # FastAPI 服务层
   errors.py             # 异常分类（LLM 错误 → 502/429/500 语义化响应）
   api/chat.py           # POST /chat（认证 + 线程归属校验）
   api/approve.py        # POST /approve（HITL 审批，归属校验 + 审计）
-  api/auth.py           # POST /auth/register / /auth/login
+  api/auth.py           # POST /auth/register / /auth/login / /auth/introspect
   api/threads.py        # GET/PATCH/DELETE /threads（列表 / 改名 / 置顶 / 删除）
   api/documents.py      # 文档管理转发（BFF：前端经 agent 中转 RAG，可信身份注入 + 删除审计）
   api/health.py         # GET /health（分层：status 存活 / checks 就绪）
@@ -169,8 +169,9 @@ pytest tests\ -v
 | 端点 | 方法 | 认证 | 说明 |
 |---|---|---|---|
 | `/health` | GET | 无 | 分层健康检查：`status`（存活=agent+db）供编排 / `checks`（db/rag/llm 就绪）供前端 |
-| `/api/auth/register` | POST | 无 | 注册（201 / 403 / 409 / 422；`REGISTRATION_ENABLED=false` 时 403 关闭） |
+| `/api/auth/register` | POST | 无 | 注册（201 / 400 / 403 / 409 / 422；`REGISTRATION_ENABLED=false` 时 403 关闭） |
 | `/api/auth/login` | POST | 无 | 登录 → JWT（200 / 401 / 403） |
+| `/api/auth/introspect` | POST | Bearer | 服务间身份校验：JWT → `{user_id, username, disabled, exp}`（供 MCP 等后端服务换取可信身份，部署时应限内网访问） |
 | `/api/chat` | POST | Bearer | 对话（新会话 / 续聊 / 审批挂起）——一次性返回，兼容/兜底 |
 | `/api/chat/stream` | POST | Bearer | **流式对话（SSE）**：阶段进度 + 逐字回答 + 审批挂起 + 随时停止 |
 | `/api/chat/cancel` | POST | Bearer | **中断**指定会话正在进行的生成（幂等，归属校验） |
