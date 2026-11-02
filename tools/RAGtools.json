@@ -8,34 +8,6 @@
             "properties": {}
         }
     },
-    "test_connection": {
-        "description": "测试一个模型连接的可用性，参数为连接配置",
-        "path": "/api/v1/connections/test",
-        "method": "POST",
-        "schema": {
-            "type": "object",
-            "properties": {
-                "kind": {
-                    "type": "string",
-                    "enum": ["embedding", "chat", "formula"],
-                    "description": "连接类型：embedding/chat/formula"
-                },
-                "base_url": {
-                    "type": "string",
-                    "description": "模型地址，须公网可达"
-                },
-                "model": {
-                    "type": "string",
-                    "description": "模型名"
-                },
-                "api_key": {
-                    "type": "string",
-                    "description": "API密钥，可选"
-                }
-            },
-            "required": ["kind", "base_url", "model"]
-        }
-    },
     "upload_documents": {
         "description": "向RAG库上传PDF文档并向量化。注意：需要用户提供本地PDF文件路径，模型无法自行生成文件内容",
         "path": "/api/v1/documents",
