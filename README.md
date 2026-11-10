@@ -45,9 +45,21 @@ tests/                # 测试
 ## 图结构
 
 ```
-START → call_llm ──(有 tool_calls)──► guard ──(approve/noop)──► call_tool
-              │                           └────(reject)──► call_llm（跳过工具）
-              └─────(无 tool_calls)────────────────────► END
+                          START
+                            │
+                            ▼
+        ┌─────────────────► call_llm ──(无 tool_calls)──► END
+        │                   │
+        │                   │ (有 tool_calls)
+        │                   ▼
+        │                 guard ──(approve / noop)──► call_tool
+        │                   │                             │
+        │                   │ (reject)                    │
+        └───────────────────┴─────────────────────────────┘
+                回到 call_llm：reject 时跳过工具，下一轮仍可能再产 tool_calls
+
+循环没有次数上限，唯一出口是 call_llm 的「无 tool_calls」分支；
+兜底靠框架 recursion_limit（默认 25），超出抛 GraphRecursionError。
 ```
 
 ## 流式对话与随时停止（SSE，2026-10 上线）
