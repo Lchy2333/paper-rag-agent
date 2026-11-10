@@ -1,15 +1,20 @@
 """用官方 LangGraph 组装 ReAct 图（含人工审批护栏）。
 
-    START
-      │
-      ▼
-   call_llm ──(有 tool_calls)──► guard ──(approve/noop)──► call_tool ──► call_llm
-      │                            │
-      │                     (reject)──► call_llm（跳过工具）
-      └─────(无 tool_calls)────────┘
-                     │
-                     ▼
-                    END
+                          START
+                            │
+                            ▼
+        ┌─────────────────► call_llm ──(无 tool_calls)──► END
+        │                   │
+        │                   │ (有 tool_calls)
+        │                   ▼
+        │                 guard ──(approve / noop)──► call_tool
+        │                   │                             │
+        │                   │ (reject)                    │
+        └───────────────────┴─────────────────────────────┘
+                回到 call_llm：reject 时跳过工具，下一轮仍可能再产 tool_calls
+
+循环没有次数上限，唯一出口是 call_llm 的「无 tool_calls」分支；
+兜底靠框架 recursion_limit（默认 25），超出抛 GraphRecursionError。
 
 guard 节点对 requires_approval 的工具调用 interrupt 挂起，等用户审批后恢复
 （需 checkpointer 支持；生产换持久化实现，学习阶段用 MemorySaver）。

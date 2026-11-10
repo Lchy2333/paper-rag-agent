@@ -11,6 +11,8 @@ from typing import Any, Dict
 
 import requests
 
+from app.request_context import request_id_var
+
 logger = logging.getLogger(__name__)
 
 # 普通接口超时（秒）：列表/详情/删除/重分块
@@ -42,6 +44,8 @@ class RagProxy:
         h = {"X-User-ID": user_id}
         if self.api_key:
             h["X-API-Key"] = self.api_key
+        # 跨进程链路追踪：RAG 侧 [ACCESS] 与 Agent 侧记同一个 rid（压测日志按 id 跨服务归堆）
+        h["X-Request-ID"] = request_id_var.get()
         return h
 
     def _url(self, path: str) -> str:

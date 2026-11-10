@@ -24,6 +24,7 @@ from agent.graph import build_graph
 from app.api import approve, auth, chat, documents, health, llm_check, threads
 from app.config import settings
 from app.errors import classify_exception
+from app.request_context import new_request_id, request_id_var
 from core import Dispatcher, ToolRegistry
 from core.llm_probe import LLMHealthTracker
 from core.model_limits import resolve_llm_limits
@@ -32,10 +33,30 @@ from tools.http_tool import HttpTool
 
 sys.stdout.reconfigure(encoding="utf-8")
 
+
+class RequestIdFilter(logging.Filter):
+    """给每条流经的日志盖 request_id 章（挂 root handler 上，一处覆盖全进程）。
+
+    机制：Filter 在 Formatter 渲染前执行，往 LogRecord 上动态贴 request_id 属性，
+    格式串里的 [%(request_id)s] 取的就是这个属性。它是"钩子"不是"快照"——
+    每条日志经过时现场读 contextvar，并发下各请求线程各拿各的 rid。
+    例外：access_logger（propagate=False + 自有 handler）不经这里，
+    [ACCESS] 行的 rid 由 middleware 手动拼接（见 access_log_middleware）。
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.request_id = request_id_var.get()
+        return True
+
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    format="%(asctime)s %(levelname)s [%(name)s] [%(request_id)s] %(message)s",
 )
+# 关卡挂到 root 的所有 handler（正常就 basicConfig 建的一个；遍历以防有库抢先配置过）
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(RequestIdFilter())
+
 logger = logging.getLogger("paper-rag-agent")
 
 # 访问日志：与 RAG（Gin）侧统一格式，走独立 logger 输出原始行（不被 basicConfig 前缀污染）：
@@ -143,19 +164,43 @@ app.include_router(llm_check.router)
 
 @app.middleware("http")
 async def access_log_middleware(request: Request, call_next):
-    """统一访问日志（对齐 RAG/Gin 侧 [ACCESS] 格式），替代 uvicorn 默认 access log。"""
+    """统一访问日志（对齐 RAG/Gin 侧 [ACCESS] 格式）+ request_id 生成/透传。
+
+    - rid：优先透传上游 X-Request-ID，否则本地生成；经 contextvar 贯穿本次请求全部日志
+      （RequestIdFilter 现场读取），并回显响应头供前端报障引用；
+    - run_id：压测批次标记（X-Load-Test 头），生产流量没有、记 "-"。仅作事后统计切片，
+      不影响任何运行时行为；
+    - request.state.rid：兜底行专用——uncaught_exception_handler 挂在更外层的
+      ServerErrorMiddleware，异常冒泡到这里时 contextvar 已被 reset，只能靠 state 捎带
+      （与 thread_id/user_id 同一机制）；
+    - try/finally：未捕获异常会穿过本层直接上抛，原实现此时不打 [ACCESS]
+      （500 请求缺端到端样本，压测错误率统计不完整），finally 补齐。
+      注意 SSE 场景时长口径：call_next 返回 ≈ 响应头就绪，全流时长要靠 span 层。
+    """
+    rid = request.headers.get("X-Request-ID") or new_request_id()
+    request.state.rid = rid
+    run_id = request.headers.get("X-Load-Test", "-")
+    token = request_id_var.set(rid)
     start = time.perf_counter()
-    response = await call_next(request)
-    access_logger.info(
-        '[ACCESS] %s | %d | %s | %s | %s "%s"',
-        time.strftime("%Y/%m/%d - %H:%M:%S", time.localtime()),
-        response.status_code,
-        _format_duration(time.perf_counter() - start),
-        request.client.host if request.client else "-",
-        request.method,
-        request.url.path,
-    )
-    return response
+    status = 500  # 异常路径无 response 可取，按 500 记
+    try:
+        response = await call_next(request)
+        status = response.status_code
+        response.headers["X-Request-ID"] = rid
+        return response
+    finally:
+        request_id_var.reset(token)
+        access_logger.info(
+            '[ACCESS] %s | %d | %s | %s | %s "%s" | rid=%s run_id=%s',
+            time.strftime("%Y/%m/%d - %H:%M:%S", time.localtime()),
+            status,
+            _format_duration(time.perf_counter() - start),
+            request.client.host if request.client else "-",
+            request.method,
+            request.url.path,
+            rid,
+            run_id,
+        )
 
 
 @app.exception_handler(Exception)
@@ -165,12 +210,16 @@ async def uncaught_exception_handler(request: Request, exc: Exception):
     - 工具调用失败不进这里（Dispatcher 已转 ToolResult → ToolMessage 正常回填）；
     - 这里接的是 LLM 调用失败（retry_call 重试穷尽 / is_transient 快速失败）
       及其余未预期异常；
-    - thread_id 由 chat/approve 路由挂到 request.state 上捎带过来（仅本次请求内有效）。
+    - thread_id 由 chat/approve 路由挂到 request.state 上捎带过来（仅本次请求内有效）；
+    - rid 由 access_log_middleware 挂到 request.state 上——本 handler 跑在更外层的
+      ServerErrorMiddleware，异常冒泡经过 middleware 时 contextvar 已被 reset，
+      Filter 在这里只能读到 "-"，所以靠 state 捎带并显式拼进消息。
     """
     status, code, message = classify_exception(exc)
     logger.error(
-        "request_failed path=%s thread_id=%s user_id=%s exc_type=%s exc_msg=%s",
+        "request_failed path=%s rid=%s thread_id=%s user_id=%s exc_type=%s exc_msg=%s",
         request.url.path,
+        getattr(request.state, "rid", "-"),
         getattr(request.state, "thread_id", None),
         getattr(request.state, "user_id", None),
         type(exc).__name__,
