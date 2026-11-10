@@ -4,6 +4,7 @@ import requests
 import time
 import json
 
+from app.request_context import request_id_var
 from core.tool import ToolBase, ToolResult
 
 
@@ -50,6 +51,10 @@ class HttpTool(ToolBase):
         headers = {}
         if user_id:
             headers["X-User-ID"] = user_id
+        # 跨进程链路追踪：把本次请求的 rid 带给 RAG，其 [ACCESS] 记同一个 id。
+        # 必须 per-request 传——session 是全进程共享的，写进 session.headers 在并发下是数据竞态。
+        # contextvar 可达性：graph 在 Starlette 线程池 worker 里迭代，anyio to_thread 自动复制上下文。
+        headers["X-Request-ID"] = request_id_var.get()
 
         start = time.time()
         if self.config.get("streaming"):
