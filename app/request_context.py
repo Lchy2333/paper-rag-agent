@@ -16,6 +16,12 @@ request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar(
     "request_id", default="-"
 )
 
+# 压测批次标记（X-Load-Test 头）：与 rid 同一生命周期、同一 set/reset 点。
+# 仅供 span 行事后统计切片（隔离压测流量 vs 真实流量），运行时不读它做任何决策。
+run_id_var: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "run_id", default="-"
+)
+
 
 def new_request_id() -> str:
     """生成 12 位 rid：hex 无分隔符不与其他日志字段冲突，12 位足够 grep 且省体积。"""

@@ -16,6 +16,7 @@ from langgraph.config import get_stream_writer
 from langgraph.graph import END
 from langgraph.types import interrupt
 
+from app.span import span
 from core.dispatcher import Dispatcher
 from core.retry import is_transient
 from core.stream_guard import GenerationCancelled, iter_stream_with_guard
@@ -54,34 +55,37 @@ def call_llm(llm, dispatcher: Dispatcher, tracker=None) -> Callable:
         if config:
             cancel_event = (config.get("configurable") or {}).get("cancel_event")
         llm_with_tools = llm.bind_tools(dispatcher.registry.list_schemas())
-        final = None
-        attempt = 0
-        while True:
-            try:
-                # 用首 token 守护包住 stream：上游挂起（限期内无数据）→ TimeoutError
-                # （瞬态，进入下方重试）；逐 chunk 检查 cancel_event（挂起时也有效）
-                for chunk in iter_stream_with_guard(
-                    llm_with_tools.stream(state["messages"]),
-                    FIRST_TOKEN_TIMEOUT,
-                    cancel_event=cancel_event,
-                ):
-                    final = chunk if final is None else final + chunk
-                break  # 流正常走完
-            except GenerationCancelled:
-                raise  # 用户主动停止：不记为 LLM 失败
-            except Exception as e:
-                # 重试规则：仅当"一个 token 都没吐出来"时才对瞬态错误重试
-                # （此时重试不会导致前端看到重复 token）；流中途失败不重试。
-                if final is not None or not is_transient(e):
-                    if tracker is not None:
-                        tracker.record_failure(str(e))
-                    raise
-                attempt += 1
-                if attempt >= 3:
-                    if tracker is not None:
-                        tracker.record_failure(str(e))
-                    raise
-                dispatcher.sleep(0.2 * attempt)
+        # span 包整个重试循环：用户感知的「等 LLM」= 所有 attempt + 退避等待之和。
+        # 重试期间 rid 经 contextvar 随线程池复制可达（span 行自动带本次请求的 id）。
+        with span("llm_call"):
+            final = None
+            attempt = 0
+            while True:
+                try:
+                    # 用首 token 守护包住 stream：上游挂起（限期内无数据）→ TimeoutError
+                    # （瞬态，进入下方重试）；逐 chunk 检查 cancel_event（挂起时也有效）
+                    for chunk in iter_stream_with_guard(
+                        llm_with_tools.stream(state["messages"]),
+                        FIRST_TOKEN_TIMEOUT,
+                        cancel_event=cancel_event,
+                    ):
+                        final = chunk if final is None else final + chunk
+                    break  # 流正常走完
+                except GenerationCancelled:
+                    raise  # 用户主动停止：不记为 LLM 失败
+                except Exception as e:
+                    # 重试规则：仅当"一个 token 都没吐出来"时才对瞬态错误重试
+                    # （此时重试不会导致前端看到重复 token）；流中途失败不重试。
+                    if final is not None or not is_transient(e):
+                        if tracker is not None:
+                            tracker.record_failure(str(e))
+                        raise
+                    attempt += 1
+                    if attempt >= 3:
+                        if tracker is not None:
+                            tracker.record_failure(str(e))
+                        raise
+                    dispatcher.sleep(0.2 * attempt)
         if tracker is not None:
             tracker.record_success()
         if final is None:  # 防御：流式空响应
@@ -130,7 +134,13 @@ def call_tool(dispatcher: Dispatcher) -> Callable:
                 else:
                     label = f"正在调用工具 {name}…"
                 writer({"label": label})
-            result = dispatcher.dispatch(name, args, user_id=user_id, on_event=writer)
+            # span 按工具名分组（tool.search_papers / tool.upload …）：阶段 P95 天然按工具统计。
+            # 工具失败不上抛（Dispatcher 转 ToolResult 正常回填）——ok 必须手动标，
+            # 否则失败请求的 span 恒为 ok=1，阶段错误率统计会漏。
+            with span(f"tool.{name}") as sp:
+                result = dispatcher.dispatch(name, args, user_id=user_id, on_event=writer)
+                if not result.success:
+                    sp.ok = 0
             content = result.data if result.success else f"工具执行失败: {result.error}"
             if writer is not None and result.success and isinstance(result.data, dict):
                 total = result.data.get("total_chunks")
