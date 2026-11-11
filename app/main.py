@@ -24,7 +24,7 @@ from agent.graph import build_graph
 from app.api import approve, auth, chat, documents, health, llm_check, threads
 from app.config import settings
 from app.errors import classify_exception
-from app.request_context import new_request_id, request_id_var
+from app.request_context import new_request_id, request_id_var, run_id_var
 from core import Dispatcher, ToolRegistry
 from core.llm_probe import LLMHealthTracker
 from core.model_limits import resolve_llm_limits
@@ -181,6 +181,7 @@ async def access_log_middleware(request: Request, call_next):
     request.state.rid = rid
     run_id = request.headers.get("X-Load-Test", "-")
     token = request_id_var.set(rid)
+    run_token = run_id_var.set(run_id)
     start = time.perf_counter()
     status = 500  # 异常路径无 response 可取，按 500 记
     try:
@@ -190,6 +191,7 @@ async def access_log_middleware(request: Request, call_next):
         return response
     finally:
         request_id_var.reset(token)
+        run_id_var.reset(run_token)
         access_logger.info(
             '[ACCESS] %s | %d | %s | %s | %s "%s" | rid=%s run_id=%s',
             time.strftime("%Y/%m/%d - %H:%M:%S", time.localtime()),

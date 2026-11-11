@@ -13,6 +13,7 @@ from app import db
 from app.auth import CurrentUser
 from app.errors import classify_exception
 from app.schemas import CancelRequest, ChatRequest, ChatResponse
+from app.span import span
 from core.usage import UsageCallbackHandler
 
 logger = logging.getLogger(__name__)
@@ -82,7 +83,10 @@ def chat(req: ChatRequest, request: Request, user=CurrentUser) -> ChatResponse:
     if is_new:
         msgs.insert(0, SystemMessage(content=system_prompt))
 
-    result = graph.invoke({"messages": msgs}, config=config)
+    # span：非流式接口的端到端秒表（graph.invoke 含 HITL 挂起语义：
+    # 挂起时 invoke 返回 __interrupt__，dur 只算到挂起点——审批等待不进服务耗时）
+    with span("chat", thread_id=thread_id):
+        result = graph.invoke({"messages": msgs}, config=config)
 
     # 用量落库（awaiting_approval 挂起也落已完成轮次）
     db.record_usage(request.app.state.pool, thread_id, str(user["id"]),
@@ -160,70 +164,77 @@ async def chat_stream(req: ChatRequest, request: Request, user=CurrentUser):
         msgs.insert(0, SystemMessage(content=system_prompt))
 
     def gen():
-        try:
-            # 先把会话 ID 发给前端：新会话时前端据此才拿到 thread_id，才能调用 /chat/cancel
-            yield _sse("session", {"thread_id": thread_id})
-            # 用量基线：请求开始先推一次，前端立即显示会话累计（随后每轮增长）
-            yield _sse("usage", usage_handler.snapshot())
-            # 注意：用同步 graph.stream，而不是 astream——
-            # PostgresSaver 只实现了同步 checkpoint 方法，astream 会调它没实现的
-            # aget_tuple 抛 NotImplementedError（即之前看到的"服务内部错误"）。
-            # 同步 stream 由 FastAPI 在线程池里迭代，不会阻塞事件循环。
-            for mode, chunk in graph.stream(
-                {"messages": msgs},
-                config=config,
-                stream_mode=["values", "custom", "messages"],
-            ):
-                if mode == "custom":
-                    # call_llm / call_tool / HttpTool 转发的阶段进度 / 用量快照
-                    if isinstance(chunk, dict):
-                        if "usage" in chunk:
-                            yield _sse("usage", chunk["usage"])
-                        else:
-                            yield _sse("stage", chunk)
-                elif mode == "messages":
-                    # LLM token 增量：列表模式下标出的是 (message, metadata) 元组。
-                    # 只转发 call_llm 轮的模型输出（call_tool 的 ToolMessage 会混进来，必须过滤掉）。
-                    msg, meta = chunk if isinstance(chunk, tuple) else (chunk, {})
-                    if meta.get("langgraph_node") != "call_llm":
-                        continue
-                    text = msg.content if getattr(msg, "content", None) else ""
-                    if isinstance(text, list):  # 多模态 content 可能是内容块列表
-                        text = "".join(
-                            str(b.get("text", "")) for b in text if isinstance(b, dict)
-                        )
-                    if text:
-                        yield _sse("token", {"delta": text})
-                elif mode == "values":
-                    # 图挂起等待审批 → 推 approval 事件后结束
-                    if "__interrupt__" in chunk:
-                        intr = chunk["__interrupt__"][0]
-                        yield _sse("approval", {
-                            "thread_id": thread_id,
-                            "approval_payload": intr.value,
-                        })
-                        return
-            yield _sse("usage", usage_handler.snapshot())  # done 前补最终用量
-            yield _sse("done", {"thread_id": thread_id})
-        except GenerationCancelled:
-            # 用户主动停止 → 推 cancel 事件，前端显示"已停止生成"
-            yield _sse("cancel", {"thread_id": thread_id})
-        except Exception as e:
-            # 流中途失败（LLM 报错等）→ 用 SSE error 事件收尾，避免前端白屏
-            logger.error("chat_stream_failed thread_id=%s exc_type=%s exc_msg=%s",
-                         thread_id, type(e).__name__, str(e)[:500])
-            logger.debug("chat_stream_failed_traceback", exc_info=True)
-            _, code, message = classify_exception(e)
-            yield _sse("error", {"error_code": code, "message": message})
-        finally:
-            # 清理取消标记，防止内存泄漏 / 下次误置位
-            request.app.state.cancels.pop(thread_id, None)
-            # 用量落库：cancel / error 也落已完成轮次，不丢账
-            db.record_usage(request.app.state.pool, thread_id, str(user["id"]),
-                            usage_handler.usage.input_tokens,
-                            usage_handler.usage.output_tokens,
-                            usage_handler.usage.calls,
-                            usage_handler.last_input_tokens)
+        # span：SSE 端到端秒表。必须包在生成器内部——路由函数 return
+        # StreamingResponse 后流才开始迭代，包在外面只量到响应头就绪（[ACCESS] 已是那个口径）。
+        # 生成器在线程池 worker 里迭代，contextvar 复制可达，rid/run_id 自动带上。
+        # ok 语义：cancel（用户主动停）= 1；流内异常已被转成 error 事件 → 手动标 0。
+        with span("chat_stream", thread_id=thread_id) as sp:
+            try:
+                # 先把会话 ID 发给前端：新会话时前端据此才拿到 thread_id，才能调用 /chat/cancel
+                yield _sse("session", {"thread_id": thread_id})
+                # 用量基线：请求开始先推一次，前端立即显示会话累计（随后每轮增长）
+                yield _sse("usage", usage_handler.snapshot())
+                # 注意：用同步 graph.stream，而不是 astream——
+                # PostgresSaver 只实现了同步 checkpoint 方法，astream 会调它没实现的
+                # aget_tuple 抛 NotImplementedError（即之前看到的"服务内部错误"）。
+                # 同步 stream 由 FastAPI 在线程池里迭代，不会阻塞事件循环。
+                for mode, chunk in graph.stream(
+                    {"messages": msgs},
+                    config=config,
+                    stream_mode=["values", "custom", "messages"],
+                ):
+                    if mode == "custom":
+                        # call_llm / call_tool / HttpTool 转发的阶段进度 / 用量快照
+                        if isinstance(chunk, dict):
+                            if "usage" in chunk:
+                                yield _sse("usage", chunk["usage"])
+                            else:
+                                yield _sse("stage", chunk)
+                    elif mode == "messages":
+                        # LLM token 增量：列表模式下标出的是 (message, metadata) 元组。
+                        # 只转发 call_llm 轮的模型输出（call_tool 的 ToolMessage 会混进来，必须过滤掉）。
+                        msg, meta = chunk if isinstance(chunk, tuple) else (chunk, {})
+                        if meta.get("langgraph_node") != "call_llm":
+                            continue
+                        text = msg.content if getattr(msg, "content", None) else ""
+                        if isinstance(text, list):  # 多模态 content 可能是内容块列表
+                            text = "".join(
+                                str(b.get("text", "")) for b in text if isinstance(b, dict)
+                            )
+                        if text:
+                            yield _sse("token", {"delta": text})
+                    elif mode == "values":
+                        # 图挂起等待审批 → 推 approval 事件后结束
+                        if "__interrupt__" in chunk:
+                            intr = chunk["__interrupt__"][0]
+                            yield _sse("approval", {
+                                "thread_id": thread_id,
+                                "approval_payload": intr.value,
+                            })
+                            return
+                yield _sse("usage", usage_handler.snapshot())  # done 前补最终用量
+                yield _sse("done", {"thread_id": thread_id})
+            except GenerationCancelled:
+                # 用户主动停止 → 推 cancel 事件，前端显示"已停止生成"（ok 保持 1）
+                yield _sse("cancel", {"thread_id": thread_id})
+            except Exception as e:
+                # 流中途失败（LLM 报错等）→ 用 SSE error 事件收尾，避免前端白屏。
+                # 异常被转成 error 事件，span 看不到 → 手动标 ok=0（阶段错误率要数它）
+                sp.ok = 0
+                logger.error("chat_stream_failed thread_id=%s exc_type=%s exc_msg=%s",
+                             thread_id, type(e).__name__, str(e)[:500])
+                logger.debug("chat_stream_failed_traceback", exc_info=True)
+                _, code, message = classify_exception(e)
+                yield _sse("error", {"error_code": code, "message": message})
+            finally:
+                # 清理取消标记，防止内存泄漏 / 下次误置位
+                request.app.state.cancels.pop(thread_id, None)
+                # 用量落库：cancel / error 也落已完成轮次，不丢账
+                db.record_usage(request.app.state.pool, thread_id, str(user["id"]),
+                                usage_handler.usage.input_tokens,
+                                usage_handler.usage.output_tokens,
+                                usage_handler.usage.calls,
+                                usage_handler.last_input_tokens)
 
     return StreamingResponse(gen(), media_type="text/event-stream", headers={
         "Cache-Control": "no-cache",
