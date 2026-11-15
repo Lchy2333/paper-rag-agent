@@ -106,6 +106,22 @@ def test_chat_stream_filters_tool_message_tokens(client):
     assert "event: done" in r.text
 
 
+def test_chat_stream_forwards_force_answer_tokens(client):
+    """force_answer（软上限收尾）的回答 token 必须下发给前端——
+    降级路径用户的回答只经 token 事件送达，过滤掉等于用户收不到答案。"""
+    app.state.graph = _FakeGraph([
+        ("messages", (AIMessageChunk(content=""), {"langgraph_node": "call_llm"})),
+        ("messages", (AIMessageChunk(content="基于已有信息的收尾回答"),
+                      {"langgraph_node": "force_answer"})),
+        ("values", {"messages": []}),
+    ])
+
+    r = client.post("/api/chat/stream", json={"query": "hi"})
+    assert r.status_code == 200
+    assert "event: token" in r.text and "基于已有信息的收尾回答" in r.text
+    assert "event: done" in r.text
+
+
 def test_chat_stream_approval_interrupt(client):
     """图挂起 → 推送 approval 事件后结束（不发 done）。"""
     app.state.graph = _FakeGraph([

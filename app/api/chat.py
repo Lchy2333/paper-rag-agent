@@ -7,6 +7,7 @@ import uuid
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.errors import GraphRecursionError
 
 from agent.nodes import GenerationCancelled
 from app import db
@@ -87,6 +88,8 @@ def chat(req: ChatRequest, request: Request, user=CurrentUser) -> ChatResponse:
             "user_id": str(user["id"]),
             "compress": compress,
         },
+        # 硬保险丝：langgraph 1.x 默认 10007 等于无保险丝，必须显式设置（P0）
+        "recursion_limit": request.app.state.settings.recursion_limit,
         "callbacks": [usage_handler],
     }
 
@@ -109,7 +112,12 @@ def chat(req: ChatRequest, request: Request, user=CurrentUser) -> ChatResponse:
     # span：非流式接口的端到端秒表（graph.invoke 含 HITL 挂起语义：
     # 挂起时 invoke 返回 __interrupt__，dur 只算到挂起点——审批等待不进服务耗时）
     with span("chat", thread_id=thread_id):
-        result = graph.invoke({"messages": msgs}, config=config)
+        try:
+            result = graph.invoke({"messages": msgs}, config=config)
+        except GraphRecursionError:
+            # 硬保险丝触发（软上限 force_answer 正常时到不了这里）
+            raise HTTPException(status_code=500,
+                                detail="已达到最大推理步数，请换个问法或缩小问题范围")
 
     # 用量落库（awaiting_approval 挂起也落已完成轮次）
     db.record_usage(request.app.state.pool, thread_id, str(user["id"]),
@@ -175,6 +183,8 @@ async def chat_stream(req: ChatRequest, request: Request, user=CurrentUser):
             "cancel_event": cancel_event,
             "compress": compress,
         },
+        # 硬保险丝：langgraph 1.x 默认 10007 等于无保险丝，必须显式设置（P0）
+        "recursion_limit": request.app.state.settings.recursion_limit,
         "callbacks": [usage_handler],
     }
 
@@ -220,9 +230,10 @@ async def chat_stream(req: ChatRequest, request: Request, user=CurrentUser):
                                 yield _sse("stage", chunk)
                     elif mode == "messages":
                         # LLM token 增量：列表模式下标出的是 (message, metadata) 元组。
-                        # 只转发 call_llm 轮的模型输出（call_tool 的 ToolMessage 会混进来，必须过滤掉）。
+                        # 只转发模型输出节点（call_tool 的 ToolMessage 会混进来，必须过滤掉）；
+                        # force_answer（软上限收尾）的回答也要下发，否则降级路径用户收不到答案。
                         msg, meta = chunk if isinstance(chunk, tuple) else (chunk, {})
-                        if meta.get("langgraph_node") != "call_llm":
+                        if meta.get("langgraph_node") not in ("call_llm", "force_answer"):
                             continue
                         text = msg.content if getattr(msg, "content", None) else ""
                         if isinstance(text, list):  # 多模态 content 可能是内容块列表
@@ -245,6 +256,12 @@ async def chat_stream(req: ChatRequest, request: Request, user=CurrentUser):
             except GenerationCancelled:
                 # 用户主动停止 → 推 cancel 事件，前端显示"已停止生成"（ok 保持 1）
                 yield _sse("cancel", {"thread_id": thread_id})
+            except GraphRecursionError:
+                # 硬保险丝触发（软上限 force_answer 正常时到不了这里）——最后的防线
+                sp.ok = 0
+                logger.error("chat_stream_recursion_limit thread_id=%s", thread_id)
+                yield _sse("error", {"error_code": "GRAPH_RECURSION_LIMIT",
+                                     "message": "已达到最大推理步数，请换个问法或缩小问题范围"})
             except Exception as e:
                 # 流中途失败（LLM 报错等）→ 用 SSE error 事件收尾，避免前端白屏。
                 # 异常被转成 error 事件，span 看不到 → 手动标 ok=0（阶段错误率要数它）
