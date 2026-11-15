@@ -59,7 +59,8 @@ tests/                # 测试
                 回到 call_llm：reject 时跳过工具，下一轮仍可能再产 tool_calls
 
 循环没有次数上限，唯一出口是 call_llm 的「无 tool_calls」分支；
-兜底靠框架 recursion_limit（默认 25），超出抛 GraphRecursionError。
+兜底靠框架 recursion_limit——⚠️ langgraph 1.x 默认已改为 10007（可环境变量覆盖），
+等于无保险丝；应在 invoke config 显式设置（如 25），超出抛 GraphRecursionError。
 ```
 
 ## 流式对话与随时停止（SSE，2026-10 上线）

@@ -18,7 +18,9 @@
                 回到 call_llm：reject 时跳过工具，下一轮仍可能再产 tool_calls
 
 循环没有次数上限，唯一出口是 call_llm 的「无 tool_calls」分支；
-兜底靠框架 recursion_limit（默认 25），超出抛 GraphRecursionError。
+兜底靠框架 recursion_limit——⚠️ langgraph 1.x 默认已改为 10007（_internal/_config.py，
+DEFAULT_RECURSION_LIMIT，可环境变量覆盖），等于无保险丝；应在 invoke config 显式设置
+（如 25），超出抛 GraphRecursionError。
 
 compress 只在请求起点跑一次（app 层按上次实测水位判定并经 config 传入）；
 HITL 恢复段（/api/approve）不传 compress → 恢复时不会意外二次压缩。
@@ -33,6 +35,7 @@ from agent.nodes import (
     call_llm,
     call_tool,
     compress_node,
+    force_answer,
     guard_node,
     route_after_guard,
     route_after_llm,
@@ -48,6 +51,9 @@ def build_graph(llm, dispatcher, checkpointer=None, llm_tracker=None,
     graph.add_node("call_llm", call_llm(llm, dispatcher, tracker=llm_tracker))
     graph.add_node("guard", guard_node(dispatcher))
     graph.add_node("call_tool", call_tool(dispatcher))
+    # 软上限收尾节点：裸 LLM（不绑工具）——工具轮次达 max_tool_rounds 时
+    # route_after_llm 分流到这里，基于已有检索结果体面作答（P0，见压测总报告 §3.4）
+    graph.add_node("force_answer", force_answer(llm))
 
     if compress_keep_rounds:
         # 压缩按请求粒度触发（configurable.compress），不触发时零开销直达 call_llm
@@ -59,6 +65,7 @@ def build_graph(llm, dispatcher, checkpointer=None, llm_tracker=None,
     else:
         graph.add_edge(START, "call_llm")
     graph.add_edge("call_tool", "call_llm")
+    graph.add_edge("force_answer", END)
     graph.add_conditional_edges("call_llm", route_after_llm)
     graph.add_conditional_edges(
         "guard",

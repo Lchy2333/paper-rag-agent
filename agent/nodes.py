@@ -23,6 +23,7 @@ from langgraph.graph import END
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.types import interrupt
 
+from app.config import settings
 from app.span import span
 from core.dispatcher import Dispatcher
 from core.retry import is_transient
@@ -34,6 +35,29 @@ logger = logging.getLogger(__name__)
 # 上游挂起（对 stream 请求不吐数据）若不判死，会无限阻塞线程池线程；
 # 判死抛 TimeoutError（is_transient 已覆盖）→ 由下方重试循环按瞬态错误重试。
 FIRST_TOKEN_TIMEOUT = 30.0
+
+# 工具轮次防线（P0）的两句结构化提示。与 prompt 纪律（settings.system_prompt）的分工：
+# prompt 管"早点停、停得体面"（但会被滚雪球稀释）；这两处结构管"永远停得下来"。
+# force_answer 用裸 LLM（不绑工具）——模型物理上无法再发 tool_calls，比任何指令都硬。
+FORCE_ANSWER_INSTRUCTION = (
+    "已达到检索次数上限。请基于以上已获取的信息直接回答用户；"
+    "未找到的部分明确说明，不要编造，也不要再尝试检索。"
+)
+
+
+def _tool_rounds_since_human(messages) -> int:
+    """本轮工具轮次：最后一条 HumanMessage 之后、带 tool_calls 的 AI 消息数。
+
+    只数本轮的原因：多轮老会话的历史轮次也带 tool_calls，若全量计数，
+    长会话会在一个全新的问题上误触软上限。
+    """
+    rounds = 0
+    for m in reversed(messages):
+        if isinstance(m, HumanMessage):
+            break
+        if isinstance(m, AIMessage) and getattr(m, "tool_calls", None):
+            rounds += 1
+    return rounds
 
 
 def call_llm(llm, dispatcher: Dispatcher, tracker=None) -> Callable:
@@ -154,17 +178,75 @@ def call_tool(dispatcher: Dispatcher) -> Callable:
                 if total is not None:
                     writer({"label": f"检索完成 · 命中 {total} 条相关片段"})
             tool_msgs.append(ToolMessage(content=str(content), tool_call_id=tc["id"]))
+        # 动态收口提示（第 2 轮起追加）：写在最后一条工具结果的末尾——位置新鲜
+        # （模型当下必读），比系统提示更抗上下文稀释。232s 案例的教训：滚雪球时
+        # 第 0 位的系统约束会被 23 轮工具结果淹没，而最新的工具结果永远是焦点。
+        rounds = _tool_rounds_since_human(state["messages"])
+        if rounds >= 2 and tool_msgs:
+            tool_msgs[-1].content += (
+                f"\n\n[系统提示] 已检索 {rounds} 次未获得足够依据。"
+                "若无更好的检索策略，请基于以上信息直接回答用户；未找到的部分明确说明。"
+            )
         return {"messages": tool_msgs}
 
     return node
 
 
 def route_after_llm(state: Dict[str, Any]) -> str:
-    """条件边：LLM 决定调工具 → guard（先过审批）；否则结束。"""
+    """条件边：LLM 决定调工具 → 轮次未达软上限走 guard（先过审批）；
+    达软上限走 force_answer（裸 LLM 强制收尾）；否则结束。
+
+    软上限（settings.max_tool_rounds）给用户"基于已有证据的体面回答"，
+    recursion_limit（invoke config）只在软上限失效时兜底——两层防线见
+    loadtest/report-压测总报告.md §3.4/§8 P0。
+    """
     last = state["messages"][-1]
-    if isinstance(last, AIMessage) and last.tool_calls:
-        return "guard"
-    return END
+    if not (isinstance(last, AIMessage) and last.tool_calls):
+        return END
+    if _tool_rounds_since_human(state["messages"]) >= settings.max_tool_rounds:
+        return "force_answer"
+    return "guard"
+
+
+def force_answer(llm) -> Callable:
+    """软着陆节点：工具轮次达上限后，用**不绑工具**的裸 LLM 强制收尾。
+
+    与 recursion_limit 硬保险丝的分工：模型读了几十条候选 chunk，其实有素材
+    可答——软上限把"检索失败"变成一次正常的、基于已有证据的回答；硬上限只在
+    软上限失效时兜底（抛 GraphRecursionError，gen() 转 SSE error）。
+    协议安全：被拦截那轮的 tool_calls 若不给 ToolMessage 应答，消息列表就以
+    悬空 tool_call 结尾（严格 provider 直接 400，§2.4/§2.5 同族坑）——所以先为
+    每个 tool_call_id 补一条"未执行"的 ToolMessage，再让裸 LLM 收尾。
+    降级必须可观测：warn 计数 + 前端 label（fail-open 三案例的教训）。
+    """
+    def node(state: Dict[str, Any], config: RunnableConfig | None = None) -> Dict[str, Any]:
+        try:
+            writer = get_stream_writer() or None
+        except Exception:
+            writer = None
+        # 取消检查：invoke 是阻塞调用，生成中途打断不了，但在节点边界检查
+        # 能保证「停止生成」最迟在收尾回答跑完后立刻生效（不会照常推送）。
+        cancel_event = None
+        if config:
+            cancel_event = (config.get("configurable") or {}).get("cancel_event")
+        if cancel_event is not None and cancel_event.is_set():
+            raise GenerationCancelled()
+        rounds = _tool_rounds_since_human(state["messages"])
+        logger.warning("agent.force_answer rounds=%s —— 软上限收尾（降级计数）", rounds)
+        if writer is not None:
+            writer({"label": "已达检索次数上限，基于已有信息作答…"})
+        last = state["messages"][-1]
+        skip = [
+            ToolMessage(content="已达检索次数上限，本次工具调用未执行。", tool_call_id=tc["id"])
+            for tc in (getattr(last, "tool_calls", None) or [])
+        ]
+        msgs = list(state["messages"]) + skip + [SystemMessage(content=FORCE_ANSWER_INSTRUCTION)]
+        answer = llm.invoke(msgs, config) if config is not None else llm.invoke(msgs)
+        if cancel_event is not None and cancel_event.is_set():
+            raise GenerationCancelled()  # invoke 期间用户点了停止 → 丢弃结果，按取消收尾
+        return {"messages": skip + [AIMessage(content=answer.content)]}
+
+    return node
 
 
 def guard_node(dispatcher: Dispatcher) -> Callable:

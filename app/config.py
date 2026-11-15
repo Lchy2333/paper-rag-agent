@@ -54,6 +54,22 @@ class Settings(BaseSettings):
     compression_threshold: float = 0.8
     compression_keep_rounds: int = 4
 
+    # 工具轮次防线（P0；背景：压测 232s 案例 = 模型 23 轮失控检索，
+    # 见 loadtest/report-压测总报告.md §3.4——空结果是合法返回值不是错误，
+    # ReAct 唯一出口是"模型不再发 tool_calls"，必须用结构兜底）
+    max_tool_rounds: int = 4    # 软上限：单次提问内带 tool_calls 的 AI 消息数（只数本轮，
+                                # 从最后一条 HumanMessage 起算，多轮老会话的历史不计）。
+                                # 达到后 route_after_llm 分流到 force_answer：裸 LLM
+                                # （不绑工具，物理无法再发 tool_calls）强制收尾，
+                                # 用户仍能拿到基于已有检索结果的回答（体面降级）
+    recursion_limit: int = 20   # 硬上限：随 invoke config 传给 LangGraph 的保险丝，
+                                # 超出抛 GraphRecursionError（gen() 捕获转 SSE error，
+                                # 正常流量到不了这里——软上限才是主力）。
+                                # ⚠️ langgraph 1.x 默认 10007（_internal/_config.py 的
+                                # DEFAULT_RECURSION_LIMIT，可环境变量覆盖）等于无保险丝，
+                                # 必须显式设置；取值需 ≥ max_tool_rounds × 3（每轮
+                                # call_llm+guard+call_tool 三节点）+ compress / HITL 余量
+
     # RAG 服务
     rag_base_url: str = "http://localhost:8080"
     # 服务间鉴权（RAG 的 server.api_key）；为空表示 RAG 未启用鉴权，不发送该头
@@ -77,7 +93,11 @@ class Settings(BaseSettings):
 
 【工作流程】
 1. 默认先调 search_rag 检索，再用结果组织回答。
-2. 一次提问可能涉及多个子问题，可调用多次工具、合并后综合回答。
+2. 每个问题最多检索 2 次；两次用不同的关键词角度，不要重复相近的检索词。
+3. 检索结果为空或明显无关 → 直接告知用户"库中没有相关内容"，不要继续尝试。
+4. 找到主题相关但缺少问题细节的资料 → 基于已有资料回答，并明确说明
+   "你问的 XX 细节在库中未找到"——这是合法的回答，不要为它继续检索。
+5. 一次提问涉及多个子问题时可合并检索，但整体仍受 2 次检索上限约束。
 
 【回答原则】
 - 回答必须严格基于检索到的参考文献内容，并引用对应来源。

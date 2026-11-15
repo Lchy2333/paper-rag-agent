@@ -30,7 +30,11 @@ def approve(req: ApproveRequest, request: Request, user=CurrentUser):
         raise HTTPException(status_code=403, detail="无权操作该会话")
 
     # user_id 来自 JWT 验签（user["id"]），不可取自请求体（前端可伪造，见避坑 #18）
-    config = {"configurable": {"thread_id": req.thread_id, "user_id": str(user["id"])}}
+    # recursion_limit 硬保险丝：恢复段同样要设（langgraph 1.x 默认 10007 = 无保险丝）
+    config = {
+        "configurable": {"thread_id": req.thread_id, "user_id": str(user["id"])},
+        "recursion_limit": request.app.state.settings.recursion_limit,
+    }
     request.state.thread_id = req.thread_id  # 捎带给 exception_handler 做日志关联
     request.state.user_id = str(user["id"])
     resume_value = "allow" if req.approved else "reject"
