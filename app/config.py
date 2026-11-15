@@ -48,6 +48,12 @@ class Settings(BaseSettings):
     # models.dev 目录里的 provider 条目名（火山 Agent Plan 为 volcengine-coding-plan）
     llm_provider_id: str = "volcengine-coding-plan"
 
+    # 上下文压缩（摘要 + 前 N 轮）：上次实测水位（query_usage.last_input_tokens）
+    # ≥ 阈值 × 输入预算时，本次请求进图先压缩历史再对话（agent/nodes.py compress_node）
+    context_compression_enabled: bool = True
+    compression_threshold: float = 0.8
+    compression_keep_rounds: int = 4
+
     # RAG 服务
     rag_base_url: str = "http://localhost:8080"
     # 服务间鉴权（RAG 的 server.api_key）；为空表示 RAG 未启用鉴权，不发送该头

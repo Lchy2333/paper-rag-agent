@@ -40,6 +40,21 @@ def _resolve_thread(req: ChatRequest, request: Request, user) -> str:
     return thread_id
 
 
+def _need_compress(app_state, thread_usage: dict, limits) -> bool:
+    """压缩触发判定：上次实测水位 ≥ 阈值 × 输入预算 → 本次进图先压缩历史。
+
+    用 query_usage.last_input_tokens（provider 测量值）判定，不引入 tokenizer；
+    开关关闭 / 预算未知（窗口未知）/ 新会话（水位 0）→ 永不压缩。
+    """
+    settings = getattr(app_state, "settings", None)
+    if settings is None or not settings.context_compression_enabled:
+        return False
+    if not limits or not limits.input_budget:
+        return False
+    last_input = thread_usage.get("last_input_tokens") or 0
+    return last_input >= settings.compression_threshold * limits.input_budget
+
+
 @router.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest, request: Request, user=CurrentUser) -> ChatResponse:
     graph = request.app.state.graph
@@ -51,9 +66,13 @@ def chat(req: ChatRequest, request: Request, user=CurrentUser) -> ChatResponse:
     request.state.thread_id = thread_id  # 捎带给 exception_handler 做日志关联
     request.state.user_id = str(user["id"])
 
-    # 用量统计：读 session 基线 → 挂 callback（节点零改动，图内所有 LLM 调用自动累计）
-    session_in, session_out = db.get_session_usage(request.app.state.pool, thread_id)
+    # 用量统计：读 session 基线 + 上次水位 → 挂 callback（节点零改动，图内所有 LLM 调用自动累计）
     limits = getattr(request.app.state, "llm_limits", None)
+    thread_usage = db.get_thread_usage(request.app.state.pool, thread_id)
+    session_in = thread_usage["input_tokens"]
+    session_out = thread_usage["output_tokens"]
+    # 压缩触发：上次实测水位 ≥ 阈值 × 输入预算 → 本次进图先压缩历史（compress 节点）
+    compress = _need_compress(request.app.state, thread_usage, limits)
     usage_handler = UsageCallbackHandler(
         thread_id,
         str(user["id"]),
@@ -63,7 +82,11 @@ def chat(req: ChatRequest, request: Request, user=CurrentUser) -> ChatResponse:
         context_window=limits.context_window if limits else None,
     )
     config = {
-        "configurable": {"thread_id": thread_id, "user_id": str(user["id"])},
+        "configurable": {
+            "thread_id": thread_id,
+            "user_id": str(user["id"]),
+            "compress": compress,
+        },
         "callbacks": [usage_handler],
     }
 
@@ -130,9 +153,13 @@ async def chat_stream(req: ChatRequest, request: Request, user=CurrentUser):
     cancel_event = threading.Event()
     request.app.state.cancels[thread_id] = cancel_event
 
-    # 用量统计：读 session 基线 → 挂 callback；gen() 里每轮推送 + finally 落库
-    session_in, session_out = db.get_session_usage(request.app.state.pool, thread_id)
+    # 用量统计：读 session 基线 + 上次水位 → 挂 callback；gen() 里每轮推送 + finally 落库
     limits = getattr(request.app.state, "llm_limits", None)
+    thread_usage = db.get_thread_usage(request.app.state.pool, thread_id)
+    session_in = thread_usage["input_tokens"]
+    session_out = thread_usage["output_tokens"]
+    # 压缩触发：上次实测水位 ≥ 阈值 × 输入预算 → 本次进图先压缩历史（compress 节点）
+    compress = _need_compress(request.app.state, thread_usage, limits)
     usage_handler = UsageCallbackHandler(
         thread_id,
         str(user["id"]),
@@ -146,6 +173,7 @@ async def chat_stream(req: ChatRequest, request: Request, user=CurrentUser):
             "thread_id": thread_id,
             "user_id": str(user["id"]),
             "cancel_event": cancel_event,
+            "compress": compress,
         },
         "callbacks": [usage_handler],
     }
