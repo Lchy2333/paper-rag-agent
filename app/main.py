@@ -116,7 +116,13 @@ def build_agent():
     checkpointer.setup()  # 自动建 checkpoints / checkpoint_blobs / checkpoint_writes
     # LLM 健康跟踪器：call_llm 记录真实调用成败 → /health 被动信号（零额外请求）
     llm_tracker = LLMHealthTracker()
-    graph = build_graph(llm, dispatcher, checkpointer, llm_tracker=llm_tracker)
+    graph = build_graph(
+        llm, dispatcher, checkpointer,
+        llm_tracker=llm_tracker,
+        compress_keep_rounds=(
+            settings.compression_keep_rounds if settings.context_compression_enabled else None
+        ),
+    )
     # 文档管理转发器（BFF）：前端经 agent 中转访问 RAG，可信身份 + 服务端持有 API Key。
     # 复用同一个 session（已带 X-API-Key 默认头），rag_api_key 单独传入供显式引用。
     rag_proxy = RagProxy(session, settings.rag_base_url, settings.rag_api_key)

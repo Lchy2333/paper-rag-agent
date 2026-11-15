@@ -1,4 +1,4 @@
-"""图节点：call_llm / call_tool / route_after_llm。
+"""图节点：call_llm / compress / call_tool / guard 与各条件边。
 
 节点收 state（AgentState），返回"增量"dict；官方引擎用 add_messages reducer
 自动把返回的 messages 合并进全局 state。
@@ -10,10 +10,17 @@ import json
 import logging
 from typing import Any, Callable, Dict
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    HumanMessage,
+    RemoveMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langchain_core.runnables import RunnableConfig
 from langgraph.config import get_stream_writer
 from langgraph.graph import END
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.types import interrupt
 
 from app.span import span
@@ -195,3 +202,121 @@ def guard_node(dispatcher: Dispatcher) -> Callable:
 def route_after_guard(state: Dict[str, Any]) -> str:
     """条件边：guard 决策 → approve/noop 走 call_tool，reject 跳过工具回 call_llm。"""
     return state.get("route", "approve")
+
+
+# ── 上下文压缩（摘要 + 前 N 轮）────────────────────────────────────────────
+# 触发：app 层读 query_usage.last_input_tokens（上次实测水位），≥ 阈值 × input_budget
+# 时经 config["configurable"]["compress"]=True 传入；START 条件边据此分流。
+# 节点内一次 llm.invoke 生成摘要（走 callbacks 自动计费），失败 fail-open 放弃压缩。
+
+SUMMARY_MARKER = "【历史摘要】"
+
+
+def _is_summary(msg) -> bool:
+    """上一轮压缩留下的摘要消息——再次压缩时并入旧历史（两级折叠），不进前导段。"""
+    return isinstance(msg, SystemMessage) and str(msg.content).startswith(SUMMARY_MARKER)
+
+
+def _render_for_summary(messages) -> str:
+    """把旧消息渲染成纯文本喂给摘要模型（多模态 content 块只取 text）。"""
+    lines = []
+    for m in messages:
+        role = {SystemMessage: "system", HumanMessage: "user",
+                AIMessage: "assistant", ToolMessage: "tool"}.get(type(m), type(m).__name__)
+        content = m.content
+        if isinstance(content, list):
+            content = " ".join(str(b.get("text", "")) for b in content if isinstance(b, dict))
+        text = str(content).strip()
+        if text:
+            lines.append(f"{role}: {text[:2000]}")
+    return "\n".join(lines)
+
+
+def split_for_compression(messages, keep_rounds: int):
+    """按轮切分历史，返回 (leading_system, old_msgs, kept_msgs)；无可压缩内容返回 None。
+
+    轮 = 一条 HumanMessage 起头的完整段（Human…到下一条 Human 前），切点必落在
+    HumanMessage 边界 → 永远不会拆散 AIMessage(tool_calls) / ToolMessage 配对
+    （拆散会被 OpenAI 协议拒单）。leading_system = 前导 SystemMessage（system prompt）；
+    旧摘要不在此列——进 old 被重新折叠进新摘要。
+    """
+    msgs = list(messages)
+    head, i = [], 0
+    while i < len(msgs) and isinstance(msgs[i], SystemMessage) and not _is_summary(msgs[i]):
+        head.append(msgs[i])
+        i += 1
+    rest = msgs[i:]
+    human_pos = [j for j, m in enumerate(rest) if isinstance(m, HumanMessage)]
+    if not human_pos or len(human_pos) <= keep_rounds:
+        return None
+    cut = human_pos[-keep_rounds]  # 最近 keep_rounds 轮的起点
+    old, kept = rest[:cut], rest[cut:]
+    if not old:
+        return None
+    return head, old, kept
+
+
+_SUMMARY_PROMPT = """你在压缩一个论文问答助手的对话历史。只陈述已发生的内容，严禁编造。
+以下是按时间排列的旧消息（system=此前的历史摘要 / user=用户 / assistant=回答 / tool=工具结果）。
+请用不超过 400 字输出（某部分没有就省略）：
+1. 用户核心目标
+2. 已确认的事实与约束
+3. 已执行的工具调用及结果要点（论文名、检索结果的关键信息要保留）
+4. 未决事项
+
+对话历史：
+{history}"""
+
+
+def compress_node(llm, keep_rounds: int) -> Callable:
+    """压缩节点：旧历史 → 一条摘要 + 保留最近 N 轮，RemoveMessage 重建 messages 通道。
+
+    - 摘要调用走 config.callbacks → UsageCallbackHandler 自动计费（节点内新增
+      LLM 调用点的零接入成本，见 §7.2 回调方案）；
+    - 超时由 llm 客户端 read 超时兜底；失败 fail-open：放弃本次压缩返回空增量，
+      绝不让压缩失败连累对话请求（与 rerank fail-open 同一哲学）；
+    - 返回 [RemoveMessage(REMOVE_ALL), system, 摘要, *近N轮]：add_messages 在一次
+      合并内完成"清空+重建"（REMOVE_ALL 必须在列表首位），本步落盘的 checkpoint
+      即重建后的完整列表，无中间态。
+    """
+    def node(state: Dict[str, Any], config: RunnableConfig | None = None) -> Dict[str, Any]:
+        cfg = (config or {}).get("configurable") or {}
+        if not cfg.get("compress"):
+            return {}
+        split = split_for_compression(state["messages"], keep_rounds)
+        if split is None:
+            # 触发了但没得压（轮数 ≤ N）：静默跳过会让"水位超限却永不压缩"变得隐蔽
+            # （§7.4 教训：不触发时不报错 ≠ 可以不打日志），记一条 info 便于排查
+            logger.info("compress_skipped old_rounds_empty keep_rounds=%d", keep_rounds)
+            return {}
+        head, old, kept = split
+        try:
+            try:
+                writer = get_stream_writer() or None
+            except Exception:
+                writer = None
+            if writer is not None:
+                writer({"label": "对话较长，正在压缩历史…"})
+            summary = llm.invoke(
+                _SUMMARY_PROMPT.format(history=_render_for_summary(old))
+            ).content
+            logger.info("history_compressed old_msgs=%d kept_msgs=%d summary_len=%d",
+                        len(old), len(kept), len(str(summary)))
+        except Exception as e:
+            logger.warning("compress_failed_skip exc_type=%s exc_msg=%s",
+                           type(e).__name__, str(e)[:200])
+            return {}
+        summary_msg = SystemMessage(content=f"{SUMMARY_MARKER}\n{summary}")
+        return {"messages": [
+            RemoveMessage(id=REMOVE_ALL_MESSAGES),
+            *head,
+            summary_msg,
+            *kept,
+        ]}
+    return node
+
+
+def route_from_start(state: Dict[str, Any], config: RunnableConfig | None = None) -> str:
+    """条件边：app 层按上次实测水位判定需要压缩 → 先进 compress，否则直达 call_llm。"""
+    cfg = (config or {}).get("configurable") or {}
+    return "compress" if cfg.get("compress") else "call_llm"
