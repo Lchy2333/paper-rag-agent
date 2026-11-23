@@ -328,3 +328,45 @@ def test_thread_usage_other_user_403(ctx, monkeypatch):
     finally:
         _clear_user()
     assert r.status_code == 403
+
+
+def test_messages_restores_visible_history_and_approval(ctx, monkeypatch):
+    from types import SimpleNamespace
+    from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
+
+    c, g = ctx
+    _as_user(USER_A)
+    monkeypatch.setattr("app.db.get_thread", lambda pool, tid: _thread_row())
+    monkeypatch.setattr(g, "get_state", lambda config: SimpleNamespace(
+        values={"messages": [
+            SystemMessage(content="private system prompt"),
+            HumanMessage(content="hello"),
+            AIMessage(content="", tool_calls=[{"id": "x", "name": "search", "args": {}}]),
+            ToolMessage(content="private tool result", tool_call_id="x"),
+            AIMessage(content=[{"type": "text", "text": "answer"}]),
+        ]},
+        interrupts=[SimpleNamespace(value={"tool": "delete", "args": {}})],
+    ))
+    try:
+        r = c.get(f"/api/threads/{THREAD}/messages")
+    finally:
+        _clear_user()
+    assert r.status_code == 200
+    assert r.json()["messages"] == [
+        {"role": "user", "content": "hello", "approval": None},
+        {"role": "assistant", "content": "answer", "approval": None},
+        {"role": "assistant", "content": "", "approval": {"tool": "delete", "args": {}}},
+    ]
+
+
+@pytest.mark.parametrize("owner,status", [(USER_B, 403), (None, 404)])
+def test_messages_checks_owner_before_reading_snapshot(ctx, monkeypatch, owner, status):
+    c, g = ctx
+    _as_user(USER_A)
+    monkeypatch.setattr("app.db.get_thread", lambda pool, tid: _thread_row(owner) if owner else None)
+    monkeypatch.setattr(g, "get_state", lambda config: pytest.fail("must not read snapshot"))
+    try:
+        r = c.get(f"/api/threads/{THREAD}/messages")
+    finally:
+        _clear_user()
+    assert r.status_code == status

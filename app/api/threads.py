@@ -13,6 +13,8 @@ from app.auth import CurrentUser
 from app.schemas import (
     DeleteThreadResponse,
     ThreadOut,
+    ThreadMessageOut,
+    ThreadMessagesOut,
     ThreadUsageOut,
     UpdateThreadRequest,
 )
@@ -47,6 +49,37 @@ def list_threads(request: Request, user=CurrentUser) -> List[ThreadOut]:
         )
         for r in rows
     ]
+
+
+@router.get("/{thread_id}/messages", response_model=ThreadMessagesOut)
+def get_thread_messages(thread_id: str, request: Request, user=CurrentUser):
+    """恢复可见消息；系统提示和工具内部数据不对浏览器公开。"""
+    _get_owned_thread(request.app.state.pool, thread_id, user["id"])
+    graph = request.app.state.graph
+    if graph is None:
+        raise HTTPException(status_code=503, detail="对话服务尚未就绪")
+    snapshot = graph.get_state({"configurable": {
+        "thread_id": thread_id, "user_id": str(user["id"]),
+    }})
+    messages = []
+    for msg in snapshot.values.get("messages", []):
+        kind = getattr(msg, "type", None)
+        if kind not in ("human", "ai"):
+            continue
+        if kind == "ai" and getattr(msg, "tool_calls", None):
+            continue
+        content = msg.content
+        if isinstance(content, list):
+            content = "".join(b if isinstance(b, str) else b.get("text", "")
+                              for b in content if isinstance(b, (str, dict)))
+        if content:
+            messages.append(ThreadMessageOut(
+                role="user" if kind == "human" else "assistant", content=content,
+            ))
+    for item in snapshot.interrupts:
+        if isinstance(item.value, dict):
+            messages.append(ThreadMessageOut(role="assistant", content="", approval=item.value))
+    return ThreadMessagesOut(thread_id=thread_id, messages=messages)
 
 
 @router.get("/{thread_id}/usage", response_model=ThreadUsageOut)
