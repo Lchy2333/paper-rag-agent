@@ -65,6 +65,17 @@ class DeleteThreadResponse(BaseModel):
     thread_id: str
 
 
+class ThreadMessageOut(BaseModel):
+    role: str
+    content: str
+    approval: Optional[dict] = None
+
+
+class ThreadMessagesOut(BaseModel):
+    thread_id: str
+    messages: list[ThreadMessageOut]
+
+
 class ThreadUsageOut(BaseModel):
     """会话用量 + 上下文占用（切换会话/刷新页面时恢复前端展示）。"""
 
